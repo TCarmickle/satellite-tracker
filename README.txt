@@ -123,6 +123,16 @@ antenna's blind spot (a vertical whip hears little straight up). Move the antenn
 empty areas fill in; "Heard in" picks this run (the default), the last hour, the last day or
 everything. Every reception counts (a GNSS session adds one a second per satellite), and the
 plot only refreshes while it is on screen.
+Signal (button): instead of how much was heard, colours each 5-degree patch by the middle
+signal level (C/N0, 25-45 dB-Hz) of the GNSS satellites that passed through it - each placed by
+its own broadcast orbit. This is the map for placing the antenna: the summary underneath names
+the weakest direction ("Weakest towards W, 5 dB below SE - something there shades the antenna")
+and how often GPS satellites that were up in each direction and height were actually locked.
+A satellite drawn with a white dashed ring is 'heard, not tracked': once a minute the receiver
+searches one second of its own samples for GPS satellites that are up but that PocketSDR has
+not locked, and lists those it finds (with a rough level, ~24-33 dB-Hz) - they are there, just
+weak. Never drawn as a position or an orbit; tested offline: 0 false finds in 453 searches of
+satellites below the horizon.
 
 
 SYSTEMS: IRIDIUM, ORBCOMM, ISS AND HAM SATELLITES
@@ -187,6 +197,8 @@ running at least 10-15 minutes.
     satellites, or poor geometry at times), and the plain home setting after 30 s without one.
   - Satellites it tracks appear in the list ("GPS G06", "Galileo E18") with their Doppler
     curves, as "Doppler only, no orbit" at first.
+    A satellite counts as tracked after 5 s of steady signal (Galileo: 10 s at 30 dB-Hz, because
+    its weak locks came and went every 10-30 s), or at once when its orbit is decoded.
   - Once a satellite has been tracked long enough (about 30 seconds of strong, unbroken signal)
     its broadcast orbit (ephemeris) is decoded: the satellite's own description of its orbit.
     It then goes on the map and globe at its real height (about 20,200 km) with a full orbit,
@@ -388,7 +400,9 @@ captures\                  one set of files per receiver run:
   output-<date-time>.frames.gz  only the ring alerts and time & location frames (kept, ~1-2%
                                 of the size) - enough to rebuild the catalog
   (Orbcomm, ham and GNSS runs are named orbcomm-, ham- and gnss-<date-time> and keep only the
-  lines the tracker uses: positions, Doppler, broadcast orbits and fixes)
+  lines the tracker uses: positions, Doppler, broadcast orbits and fixes; a GNSS run with a
+  Garmin recorded beside it also has gnss-<date-time>.garmin, a raw file like .live - the
+  catalog keeps its comparison)
 tiles\                     cached map pictures from OpenStreetMap
 
 Keeping it small: once a capture is in the catalog, its raw files (.bits .live .log) are
@@ -512,6 +526,9 @@ fixes where there were 2914 in the same 100 minutes) and tightened the 95 % figu
 6.4 -> 3.5 m with Galileo). The height is checked all the time against fixes that don't need it:
 if they disagree (the antenna was moved up or down) it is dropped and learned again over 15
 minutes. Heights of fixes the height held are not used in the height figures.
+If you move the antenna up or down yourself (to a roof, a pole, another floor), open Settings >
+Location and press "Forget the learned height" under GNSS antenna height: the solver then
+learns the new one from 15 minutes of its own 5-satellite fixes (the receiver may keep running).
 WARM START, SATELLITES NOT HEARD, REFERENCE POINTS, GPX
 -------------------------------------------------------
 Ideas taken from how a Garmin GPSMAP 64st works (its chip keeps orbit predictions and its last
@@ -525,6 +542,23 @@ position between uses; its data is many small standard files):
     own orbits put them 15 degrees or more up but that aren't being tracked - a long list means the
     antenna's view of the sky is blocked (a handheld lying on it did exactly that).
   - Start-up history: the tooltip shows this session's first fixes and the median of the last ten.
+  - Almanac: every GPS and Galileo satellite also sends a rough plan of the whole constellation
+    (12.5 minutes for all of GPS). The receiver decodes it (GALM lines, kept 4 weeks in
+    gnss-solver.json with the leap seconds and the GPS-Galileo time offset), and uses it for
+    'Up but not heard', for which satellites are worth searching for, and in a satellite's info
+    window for its next pass when there is no orbit. It is only good to a few km (measured: 1-2 km
+    within 3 days, ~8 km after 6), so it is labelled 'almanac' and never drawn as the satellite.
+  - Orbit history: every broadcast orbit decoded is kept, and the map, globe and sky plot use the
+    one that was valid at the timeline time - scrubbing back a day no longer draws a satellite
+    from today's orbit (that was 0.5 km off for GPS, 8-16 km for WAAS). Leap seconds now come from
+    the satellites' own UTC message, not a fixed 18.
+  - A GNSS satellite's info window has a Signal tab: its level against its height in the sky over
+    all its passes, and a fading figure per pass ('S4-like from 1 Hz C/N0'). Around 0.05-0.1 is
+    the level the measurement's own noise gives (a quiet sky); clearly higher minutes mean the
+    signal was fading - the ionosphere, or the satellite passing behind something.
+  - The catalog keeps each pass's signal level every second and its Doppler every 10 s (it was
+    the other way round): 26 MB became 10 MB on 50 sessions. Old entries still load; the new
+    figures appear for old captures after one 'catalog.py --redo'.
   - Searching only for the satellites that are up (gnss_rx.py --narrow-search) is there but off:
     on a recording it locked fewer satellites, as pocket_trk already searches all in parallel.
   - pocket_trk's own settings: data\pocket_trk.opt (lines like 'lost_th = 10', '#' for comments)
@@ -556,8 +590,61 @@ position between uses; its data is many small standard files):
   - Sea-level heights: a Garmin on the live USB link reports the local gap between GPS's ellipsoid
     and sea level (-19.3 m here, saved in data\geoid.json); heights in the tooltip and in GPX
     exports are then above sea level.
-  - garmin_usb.py reads a Garmin handheld live over USB (with Garmin's USB driver; Interface set
-    to Garmin Spanner/Serial and No to mass storage): 'python garmin_usb.py log FILE'.
+  - A Garmin handheld beside the antenna, live over USB: while GPS L1 (or another GNSS band) is
+    receiving, a Garmin connected in its live mode is recorded next to the capture
+    (<capture>.garmin - checked at the start and every 30 s, so it can be plugged in later; the
+    recorder stops with the capture and with the tracker). After Stop the catalog compares the
+    two second by second and satellite by satellite, and the position panel gets one line - live
+    while it records, else for the last capture that had one - e.g. "Garmin beside you: 3D+WAAS,
+    EPH 3 m, 2.1 m from our average; it holds G23 G27 (W, 20-60 deg) that we do not". Its tooltip
+    has the same-second distances to our solver and to pocket_trk (median and 95 %), both
+    middles, the Garmin's clock against this PC's (a cross-check of Settings > PC clock), and per
+    satellite the seconds the Garmin heard / used it and we locked it, with where it was in the
+    sky - the satellites it uses that we never lock are the direct measure of what our receiver
+    misses. Only horizontal distances are compared (its heights are barometric), and never signal
+    levels (its "SNR" is its own scale, unrelated to our C/N0). Its fixes count as the truth only
+    when they are 3D+WAAS with EPH 5 m or better; without WAAS the line says so (a plain 3D fix
+    indoors was 9 m from home with EPH 43 m - no better than ours). Set up the Garmin once:
+      * Garmin's USB driver installed; Setup > System > Interface: Garmin Spanner;
+      * answer "No" when it asks about mass storage on plugging in ("Yes" makes it a drive for
+        the GPX import above, and then it can't be read live);
+      * Setup > System > Satellite System: GPS + GLONASS, and WAAS/EGNOS: On;
+      * put it 1-2 m from the GPS puck with a clear sky, never on top of it (it blocks the puck).
+    By hand: 'python garmin_usb.py' prints what it receives, 'python garmin_usb.py log FILE'
+    records it. Only one program can open the Garmin at a time.
+PRECISE ANTENNA POSITION (offline, RINEX files)
+-----------------------------------------------
+For the antenna's position to decimetres rather than metres, pocket_trk's raw measurements (kept
+beside every GNSS L1 (GPS) capture as <capture>.trk1.rtcm and .trk1.log) can be turned into RINEX
+3.04, the standard file format that professional GNSS processing programs read. After Stop:
+    cd C:\IridiumTracker\app
+    ..\python\python.exe ..\tools\trk2rinex.py gnss-20261106-205411
+This writes an observation file (...MO.rnx: code, carrier phase, Doppler and signal strength every
+second) and a navigation file (...GN.rnx: the orbits our receiver decoded) into
+data\rinex\<capture>\. It only writes files - nothing is sent anywhere. Options: --galileo (adds
+Galileo), --no-sbas (leaves the WAAS satellites out), --out FOLDER. On the way it fixes two things
+in pocket_trk's numbers a precise program would trip over: its code and carrier ranges drift apart
+16.7 m every second (the SDR's tuner sits ~88 Hz off frequency) and its clock jumps 20-60 ms now
+and then - the carrier is put onto the code's clock; and loss of lock is worked out from the carrier
+itself (the RTCM's lock-time field restarts every ~72 s).
+Record a long session first: the antenna must not move, open sky, 2 hours or more (longer is
+better). Then either:
+  - RTKLIB (free, rtklib.com or the "demo5" build; not included): download the nearest NGS CORS
+    station's RINEX for the same hours (NOAA's CORS map; 30 s files are fine) and its published
+    coordinates (X Y Z), then
+      rnx2rtkp -p 3 -f 1 -sys G -m 15 -h -c -r X Y Z -o antenna.pos OUR_MO.rnx CORS.rnx OUR_GN.rnx
+    (static, L1 only, GPS, elevation mask 15 degrees, fix-and-hold). The last lines of antenna.pos
+    are the answer; Q=1 means the carrier ambiguities were fixed, Q=2 only float (less exact). The
+    nearer the station the better - single-frequency works best within ~20 km.
+  - NRCan CSRS-PPP (free web service of Natural Resources Canada, needs an account; no base station
+    needed): upload the ...MO.rnx file, choose Static, single frequency is accepted. Note that this
+    UPLOADS the file to NRCan, and the file holds your antenna's position (in its header, and the
+    measurements themselves give it away) - your decision.
+What to expect: not verified here yet (RTKLIB isn't installed on this PC and nothing has been
+uploaded). From published results with L1-only receivers, a few hours of static data usually gives
+a few decimetres (better if RTKLIB fixes the ambiguities against a near station); our carrier phase
+is clean (~0.05 cycle) but this receiver holds only 5-8 GPS satellites and drops them often, and
+the puck's phase centre is not calibrated (a few centimetres).
 JAMMING AND SPOOFING WATCH (Integrity section)
 ----------------------------------------------
 The Integrity section (header button) watches the GNSS L1 (GPS) band - GPS, Galileo and WAAS -

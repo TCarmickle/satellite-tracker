@@ -38,6 +38,7 @@ GNSS_RX = os.path.join(HERE, 'gnss_rx.py')        # GPS / Galileo / BeiDou: reco
 METEOR_RX = os.path.join(HERE, 'meteor_rx.py')    # Meteor-M pictures: records the pass; SatDump decodes it after
 IMAGES_PY = os.path.join(HERE, 'images.py')
 RADIO_RX = os.path.join(HERE, 'radio_rx.py')      # Radio: spectrum and sound anywhere, retuned while it runs
+GARMIN_USB = os.path.join(HERE, 'garmin_usb.py')  # a Garmin handheld (live over USB) recorded beside a GNSS capture
 DAMAGED = ('RAW', 'ERR', 'OBAD', 'HSIG')        # frame kinds that were heard but could not be decoded
 LIMIT_GB = 2
 STATUS_EVERY = 10   # the decoder prints its totals every second; the log keeps one line in this many
@@ -102,6 +103,18 @@ def private_bytes(pid):
         ctypes.windll.kernel32.CloseHandle(h)
 
 
+# data\pocket_trk.opt as a fresh install gets it (written once, never over a file that exists)
+POCKET_TRK_OPT = """# pocket_trk 0.21 options for the live GNSS band (Satellite Tracker reads this file at every Start; one 'name = value'
+# per line, '#' starts a comment). Both values were measured on recordings on 2026-11-06 - see README.txt, GNSS.
+lost_th = 10     # windows of 0.5 s with no carrier lock before a satellite is dropped (default 4). The first second is
+                 # frequency pull-in without phase lock, so the default gave the phase loop one second: 55 % of the
+                 # satellites found at 34-36 dB-Hz were dropped at exactly 2.0 s with the signal still there. 10 gives it
+                 # 4 s; a real loss is still declared within 5 s.
+b_dll = 0.5      # code-loop bandwidth in Hz (default 0.25). At 2 samples per chip the default cannot follow the Galileo
+                 # E1B code: every E1B lock died after ~10 s. 0.5 held it for a whole recording; GPS is unaffected.
+"""
+
+
 class Receiver(QtCore.QObject):
     """start() / stop() the SDR receiver. Signals:
        status(text)      one-line state for the UI
@@ -122,6 +135,7 @@ class Receiver(QtCore.QObject):
         self.audio_port = 0           # ... and the sound
         self.sdr = sdr_settings.load()
         self.extractor = self.parser = self.decoder = None
+        self.garmin = None            # the Garmin recorder beside a GNSS capture (subprocess.Popen), see garmin_check
         self.stamp = None
         self.state = 'idle'           # idle / running / stopping / decoding
         self.timer = QtCore.QTimer(self)
@@ -241,10 +255,20 @@ class Receiver(QtCore.QObject):
             if catalog.HOME:        # (warm start: which satellites are up, from the orbits kept last time)
                 args += ['--home', '%.6f,%.6f,%.4f' % catalog.HOME]
             opt = os.path.join(paths.DATA, 'pocket_trk.opt')
+            if not os.path.exists(opt):     # a fresh install: the two measured settings (the file is the user's after)
+                try:
+                    with open(opt + '.tmp', 'w') as f:
+                        f.write(POCKET_TRK_OPT)
+                    os.replace(opt + '.tmp', opt)
+                except OSError as e:
+                    print('could not write %s (%s)' % (opt, e))
             if os.path.exists(opt):         # pocket_trk's own settings, if tuned (see README)
                 args += ['--pocket-opts', opt]
-            # pocket_trk's log and RTCM beside the capture (<name>.trk1.log / .rtcm)
-            args += ['--work-stem', self.live_path[:-len('.live')]]
+            # pocket_trk's log and RTCM beside the capture (<name>.trk1.log / .rtcm); its own working folder per band;
+            # and a stop file, so Stop lets it end normally and keep what it learned (see stop())
+            args += ['--work-stem', self.live_path[:-len('.live')],
+                     '--pocket-dir', os.path.join(paths.DATA, 'pocketsdr', self.system['key']),
+                     '--stop-file', self.live_path[:-len('.live')] + '.stop']
             import integrity
             if self.system['key'] in integrity.WATCH_BANDS:     # (it keeps 20 s of samples in memory: ~80 MB)
                 args += ['--snap-trigger', snap_trigger()]
@@ -268,6 +292,54 @@ class Receiver(QtCore.QObject):
         self.running.emit(True)
         self.status.emit('Starting %s...' % ('the replay' if self.replay else
                                              '%s on %s' % (self.system['label'], self.sdr['label'])))
+        note = self.garmin_check()
+        if note:
+            self.status.emit(note)
+
+    # ---- a Garmin handheld beside a GNSS capture
+    def garmin_check(self):
+        """at a GNSS start, and every 30 s from the tracker: a Garmin in Garmin Spanner mode (live USB - in
+        mass-storage mode it isn't listed) while a GNSS capture runs -> record it beside the capture as
+        <capture>.garmin (garmin_usb.py log), for the catalog's side-by-side comparison. Restarted if it ended; it ends
+        with this program (--parent-pid) and is stopped with the capture. -> a status text when it started one.
+        Never raises: the Garmin is a bonus, never a reason for the receiver to fail."""
+        try:
+            if self.state != 'running' or self.replay or self.system.get('system') != 'gnss':
+                return ''
+            if self.garmin is not None and self.garmin.poll() is None:
+                return ''
+            import garmin_usb
+            if not garmin_usb.device_paths():
+                return ''
+            path = self.live_path[:-len('.live')] + '.garmin'
+            again = self.garmin is not None
+            env = dict(os.environ, PATH=self.env.value('PATH'), OPENBLAS_NUM_THREADS='1')     # (as the receivers get)
+            self.garmin = subprocess.Popen([PY, GARMIN_USB, 'log', path, '--parent-pid', str(os.getpid())], cwd=HERE,
+                                           env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                           creationflags=NO_WINDOW)
+            self.garmin_path = path
+            return 'Garmin over USB: %s it beside %s (%s)' % ('recording' if not again else 'recording again',
+                                                              self.capname, os.path.basename(path))
+        except Exception as e:
+            print('Garmin recorder: %r' % e)
+            return ''
+
+    def garmin_file(self):
+        """the .garmin file being recorded beside the running capture, or None"""
+        if self.garmin is not None and self.state == 'running' and self.garmin.poll() is None:
+            return getattr(self, 'garmin_path', None)
+        return None
+
+    def _stop_garmin(self):
+        if self.garmin is None:
+            return
+        try:
+            if self.garmin.poll() is None:
+                self.garmin.kill()          # (every line it writes is appended and closed on its own)
+                self.garmin.wait(5)
+        except Exception as e:
+            print('Garmin recorder: %r' % e)
+        self.garmin = None
 
     # ---- while running
     def _tick(self):
@@ -374,7 +446,7 @@ class Receiver(QtCore.QObject):
             return
         lines = (self.out_rest + data.replace('\r\n', '\n')).split('\n')
         self.out_rest = lines.pop()
-        lines = [l for l in lines if re.match(r'^(O[A-Z]{2,3}|HFR|HSIG|GCH|GEPH|GPOS|GSPP|GGAP|GLOG|MSIG|GTIME|GNOISE|GSPEC): ', l)]
+        lines = [l for l in lines if re.match(r'^(O[A-Z]{2,3}|HFR|HSIG|GCH|GEPH|GPOS|GSPP|GGAP|GLOG|GALM|GHEARD|MSIG|GTIME|GNOISE|GSPEC): ', l)]
         if not lines:
             return
         with open(self.live_path, 'a', newline='') as f:
@@ -400,7 +472,7 @@ class Receiver(QtCore.QObject):
                     pass
                 continue
             self.frame.emit(kind, line)
-            if kind in ('GGAP', 'GLOG'):    # receiver events (a sample gap filled, pocket_trk restarted): not frames
+            if kind in ('GGAP', 'GLOG', 'GALM', 'GHEARD'):  # receiver events, almanacs, weak satellites: not frames
                 continue
             if kind in DAMAGED:
                 self.heard += 1
@@ -416,11 +488,25 @@ class Receiver(QtCore.QObject):
         self.stop_reason = reason
         self.status.emit('Stopping...')
         if self.extractor.state() != QtCore.QProcess.NotRunning:
-            # the decoder starts helper processes, so end the whole tree
-            subprocess.run(['taskkill', '/PID', str(self.extractor.processId()), '/T', '/F'],
-                           capture_output=True, creationflags=NO_WINDOW)
+            stop_file = getattr(self, 'live_path', '')[:-len('.live')] + '.stop' if getattr(self, 'live_path', '') else ''
+            if self.system.get('system') == 'gnss' and stop_file:
+                # GNSS: ask first - gnss_rx closes pocket_trk's input and pocket_trk ends normally, saving its memory
+                # file (almanacs, orbits, position) for an aided start next time; the tree is killed if it takes > 4 s
+                try:
+                    open(stop_file, 'w').close()
+                    QtCore.QTimer.singleShot(4000, self._kill_tree)
+                    return
+                except OSError:
+                    pass
+            self._kill_tree()
         else:
             self._extractor_finished()
+
+    def _kill_tree(self):
+        """end the decoder and every helper process it started (their own shutdown code does not run)"""
+        if self.extractor.state() != QtCore.QProcess.NotRunning:
+            subprocess.run(['taskkill', '/PID', str(self.extractor.processId()), '/T', '/F'],
+                           capture_output=True, creationflags=NO_WINDOW)
 
     def _extractor_finished(self, *_):
         if self.state == 'running':           # it ended by itself: the SDR is missing or busy, or a crash
@@ -451,6 +537,7 @@ class Receiver(QtCore.QObject):
 
     def _clear_running(self):
         """receiving has ended (the SDR is free; the capture may still be going into the catalog)"""
+        self._stop_garmin()         # (before the catalog reads its file)
         try:
             os.remove(self.bits_path[:-5] + RUNNING)
         except (OSError, AttributeError):

@@ -264,7 +264,7 @@ class Console(QtCore.QObject):
 
     def frame(self, line, quiet=False):
         kind = line.split(':', 1)[0]
-        if kind in ('GCH', 'GEPH', 'GPOS', 'GGAP', 'GLOG'):
+        if kind in ('GCH', 'GEPH', 'GPOS', 'GGAP', 'GLOG', 'GALM', 'GHEARD'):
             return self._gnss(kind, line.split()[1:], quiet)
         if kind in ('OEP', 'OSY', 'OPK', 'OBAD'):
             return self._orbcomm(kind, line.split()[1:], quiet)
@@ -469,6 +469,13 @@ class Console(QtCore.QObject):
             if not quiet:
                 print('%s[%s]  GAP      %s ms of samples lost (%s) - filled with zeros%s' % (
                     YELLOW, when, f[1], 'the SDR / USB path' if f[2] == 'usb' else f[2], RESET))
+        elif kind == 'GHEARD' and len(f) >= 4:   # our own search (acqdetect.py) heard a satellite pocket_trk is not
+            sat, cn0, fd = f[1], float(f[2]), float(f[3])      # tracking: its signal is here - no position, no orbit
+            el = ' at %s° up' % f[4].split('.')[0] if len(f) > 4 else ''
+            self.kinds['heard, not tracked'] += 1
+            if not quiet:
+                print('%s[%s]  HEARD    %-12s ~%.0f dB-Hz, Doppler %+.0f Hz%s - found by our own search, not tracked '
+                      '(too weak for pocket_trk to lock, or it lost it)%s' % (GREY, when, catalog.gnss_name(sat), cn0, fd, el, RESET))
         elif kind == 'GLOG' and len(f) >= 2:     # pocket_trk's own events; only the ones worth a line here
             if f[1] == 'RESTART':
                 self.kinds['restart'] += 1
@@ -476,6 +483,41 @@ class Console(QtCore.QObject):
                     print('%s[%s]  RESTART  pocket_trk restarted (%s)%s' % (YELLOW, when, ' '.join(f[2:]), RESET))
             elif f[1] == 'START' and not quiet and f[2:] != ['1']:
                 print('%s[%s]  START    pocket_trk run %s%s' % (GREY, when, ' '.join(f[2:]), RESET))
+        elif kind == 'GALM' and len(f) >= 3:     # almanacs (one line per new set, not per satellite) and UTC / GGTO
+            self._galm(f, when, quiet)
+
+    def _galm(self, f, when, quiet):
+        import nav_bits
+        sat, text = f[1], f[2]
+        sets = self.__dict__.setdefault('_alm_sets', {})
+        if sat in ('UTCG', 'UTCE'):
+            p = nav_bits.parse_utc_text(text)
+            if not p or sets.get(sat) == (p['dtLS'], p['dtLSF'], p['WNlsf'], p['DN']):
+                return
+            sets[sat] = (p['dtLS'], p['dtLSF'], p['WNlsf'], p['DN'])
+            if not quiet:
+                print('%s[%s]  TIME     %s says its time - UTC = %d s%s%s' % (
+                    GREY, when, 'GPS' if sat == 'UTCG' else 'Galileo', p['dtLS'], ' (no leap second announced)'
+                    if p['dtLS'] == p['dtLSF'] else ' - a leap second is announced: %d s after it' % p['dtLSF'], RESET))
+            return
+        a = nav_bits.parse_alm(text)
+        if not a:
+            return
+        self.kinds['almanac'] += 1
+        # a set: GPS by its reference time (a new one about daily); Galileo sends a new reference time every ~10 min
+        # and WAAS a new message every few, so those count once a day
+        ref = a['t0'] if a['sys'] == 'S' else a['toa_gpst']
+        key = (a['sys'], ref if a['sys'] == 'G' else int(ref // 86400))
+        if key in sets:
+            return
+        sets[key] = True
+        if not quiet:
+            name = {'G': 'GPS', 'E': 'Galileo', 'S': 'WAAS'}[a['sys']]
+            import gnss
+            ref_t = ref if a['sys'] == 'S' else float(gnss.gpst_to_unix(ref))
+            print('%s[%s]  ALMANAC  %s almanac arriving (reference %s): every %s satellite\'s rough orbit (a few km) - '
+                  'for "up but not heard" and pass predictions%s' % (
+                      GREY, when, name, datetime.datetime.fromtimestamp(ref_t).strftime('%a %H:%M'), name, RESET))
 
     def _gnss_lost(self):
         if not self.gnss_last or self.last_t is None:

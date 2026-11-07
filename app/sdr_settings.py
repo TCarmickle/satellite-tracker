@@ -33,6 +33,9 @@ DEFAULTS = {
     'ham2m_auto_gain': False,
     'ham70_gain': 35.0,
     'ham70_auto_gain': False,
+    'gnss1_rate': 0,            # GNSS L1 sample rate in S/s; 0 = the band's own (2.048 MS/s). 2400000 widens the
+    #                             E4000's filters (they follow the rate): Galileo's signal sits at the band edges
+    #                             (+~1.5 dB expected, GPS +0.4 dB) - an A/B to run live before making it the default
     'gnss1_gain': 40.0,         # GNSS: an active antenna's amplifier already lifts the signal
     'gnss1_auto_gain': False,
     'glo1_gain': 40.0,
@@ -103,6 +106,8 @@ def fixed_tuning(s):
 
 
 def sample_rate(s):
+    if s.get('system') == 'gnss1' and s.get('gnss1_rate'):     # (the GNSS L1 rate A/B, see DEFAULTS)
+        return int(s['gnss1_rate'])
     return systems.get(s['system'])['rate'] if fixed_tuning(s) else s['sample_rate']
 
 

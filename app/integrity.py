@@ -220,6 +220,7 @@ class Monitor:
         self.cn0 = {}                   # sat -> deque of (t, cn0)
         self.last = {}                  # sat -> (t, cn0, doppler)
         self.counts = collections.deque()   # (t, satellites locked)
+        self.cn0_drop_t = None              # when the current all-satellite C/N0 drop began (its wording)
         self.fixes = collections.deque(maxlen=600)
         self.first_fixes = []
         self.gtimes = collections.deque(maxlen=200)
@@ -485,9 +486,19 @@ class Monitor:
             if gap:
                 raw['cn0'] = (min(g, WATCH), '%+.1f dB over %d satellites (%s)' % (-d, len(drops), gap_text))
             else:
-                raw['cn0'] = (g, '%+.1f dB over %d satellites%s' % (-d, len(drops), '' if noisy or d < CN0_DROP_DB[0]
-                                                                     else ' (noise normal: blocked?)'))
+                # a stream gap recognised only from the satellites (no GGAP) is known up to GAP_REACQ_S after the
+                # drop - until then 'blocked?' was said for 3-8 s of what turned out to be the SDR/USB stream
+                if d < CN0_DROP_DB[0]:
+                    self.cn0_drop_t = None
+                elif self.cn0_drop_t is None:
+                    self.cn0_drop_t = ts
+                why = ''
+                if not noisy and d >= CN0_DROP_DB[0]:
+                    why = (' (noise normal: blocked, or a stream gap - checking)'
+                           if ts - self.cn0_drop_t < GAP_REACQ_S + 5 else ' (noise normal: blocked?)')
+                raw['cn0'] = (g, '%+.1f dB over %d satellites%s' % (-d, len(drops), why))
         else:
+            self.cn0_drop_t = None
             raw['cn0'] = (NA, 'needs 3 satellites tracked for a minute')
         before = [c for t, c in self.counts if ts - 70 <= t < ts - 15]
         if before and max(before) >= 4:

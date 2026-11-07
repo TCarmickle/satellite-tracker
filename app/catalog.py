@@ -28,6 +28,7 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import gnss_lines  # noqa: E402  (the GNSS receiver's line formats)
 import paths  # noqa: E402  (where the data lives)
 import storage  # noqa: E402
 import systems  # noqa: E402
@@ -466,7 +467,7 @@ def read_gnss(lines):
     out = []
     for line in lines:
         f = line.split(None, 3)
-        if len(f) < 3 or f[0] not in ('GCH:', 'GEPH:', 'GPOS:', 'GSPP:', 'GGAP:', 'GLOG:'):
+        if len(f) < 3 or f[0] not in ('GCH:', 'GEPH:', 'GPOS:', 'GSPP:', 'GGAP:', 'GLOG:', 'GALM:', 'GHEARD:'):
             continue
         try:
             out.append((f[0][:-1], float(f[1]), line.split()[2:]))
@@ -475,9 +476,18 @@ def read_gnss(lines):
     return out
 
 
+def _eph_key(text):
+    import gnss
+    try:
+        return gnss.archive_key(text)
+    except (ValueError, IndexError):
+        return text                 # (an odd line: kept, keyed by itself)
+
+
 def analyze_gnss(stem):
     """a GNSS capture: per satellite and pass its Doppler curve and signal level, the newest broadcast
-    ephemeris of each satellite, and the position fixes"""
+    ephemeris of each satellite ('ephemerides') and every different one ('eph_archive'), the newest almanac of each
+    satellite ('almanacs') and the UTC / GGTO parameters ('nav_params'), and the position fixes"""
     start, how = capture_start(stem)
     src = frames_source(stem)
     if src.endswith(storage.REDUCED):
@@ -495,27 +505,34 @@ def analyze_gnss(stem):
     by_sat = collections.defaultdict(list)
     bad = restarts = 0
     gaps = []
+    heard = collections.Counter()   # satellite -> GHEARD lines (one per 60 s search that found it)
+    archive, alm, params = {}, {}, {}
     for kind, t, f in rows:
         try:        # one line cut short by a crash (a field missing or half written) must not lose the capture
             if kind == 'GCH' and len(f) >= 4:
                 by_sat[f[0]].append((t, GNSS_L1 + float(f[3]), float(f[2])))
             elif kind == 'GEPH' and len(f) >= 2:
-                cap['ephemerides'][f[0]] = [round(t, 3), ' '.join(f[1:])]
+                text = ' '.join(f[1:])
+                cap['ephemerides'][f[0]] = [round(t, 3), text]     # the newest of each (what older readers use)
+                # ...and every different one (by IODE + reference time), so the tracker can draw a satellite at an
+                # earlier time with the orbit it was sending then (~18 kB a day; the later copy of one is kept)
+                archive.setdefault(f[0], {})[_eph_key(text)] = [round(t, 3), text]
+            elif kind == 'GALM' and len(f) >= 2:
+                # an almanac entry (the receiver sends each satellite's only when its reference time is newer) or the
+                # UTC / GGTO parameters: the last of each per capture
+                (params if f[0] in ('UTCG', 'UTCE', 'GGTO') else alm)[f[0]] = [round(t, 3), ' '.join(f[1:])]
             elif kind == 'GPOS' and len(f) >= 4:
-                cap['gnss_fixes'].append({'t': round(t, 3), 'lat': float(f[0]), 'lon': float(f[1]),
-                                          'height_m': float(f[2]), 'nsat': int(f[3])})
+                cap['gnss_fixes'].append(gnss_lines.gpos_fix(round(t, 3), f))
             elif kind == 'GSPP' and len(f) >= 5:
-                fx = {'t': round(t, 3), 'lat': float(f[0]), 'lon': float(f[1]), 'height_m': float(f[2]),
-                      'nsat': int(f[3]), 'hdop': float(f[4])}
-                if len(f) >= 9 and int(f[8]) < 4:
-                    fx['quick'] = True      # (a quick fix before carrier smoothing settled)
-                if len(f) >= 10 and f[9] == '1':
-                    fx['prior'] = True      # (the height row held it: its height is the antenna's, not a measurement)
+                fx = gnss_lines.gspp_fix(round(t, 3), f)        # (quick / prior flags: see gnss_lines)
+                fx.pop('waas', None)                            # (not kept: the session stats have their own)
                 cap.setdefault('gnss_spp', []).append(fx)
             elif kind == 'GGAP' and len(f) >= 1:
                 gaps.append([round(t, 3), float(f[0])])
             elif kind == 'GLOG' and len(f) >= 1 and f[0] == 'RESTART':
                 restarts += 1
+            elif kind == 'GHEARD' and len(f) >= 1:     # heard by our own search while pocket_trk was not tracking it
+                heard[f[0]] += 1
         except (ValueError, IndexError):
             bad += 1
     if bad:
@@ -524,6 +541,14 @@ def analyze_gnss(stem):
         cap['gaps'] = gaps
     if restarts:
         cap['restarts'] = restarts
+    if heard:
+        cap['heard_not_tracked'] = dict(heard)
+    if archive:
+        cap['eph_archive'] = {sat: sorted(v.values()) for sat, v in sorted(archive.items())}
+    if alm:
+        cap['almanacs'] = dict(sorted(alm.items()))
+    if params:
+        cap['nav_params'] = params
     cap['_cn0'] = [h[2] for v in by_sat.values() for h in v]
     for sat, hits in sorted(by_sat.items()):
         hits.sort()
@@ -535,16 +560,44 @@ def analyze_gnss(stem):
             cur.append(h)
         groups.append(cur)
         for g in groups:
-            cap['passes'].append({'name': gnss_name(sat), 'sat': sat, 'first': iso(g[0][0]), 'last': iso(g[-1][0]),
-                                  'frames': len(g), 'best_snr': max(h[2] for h in g),
-                                  'doppler': [[round(h[0], 3), round(h[1], 1)] for h in g]})
+            ps = {'name': gnss_name(sat), 'sat': sat, 'first': iso(g[0][0]), 'last': iso(g[-1][0]),
+                  'frames': len(g), 'best_snr': max(h[2] for h in g)}
+            ps.update(slim_pass(g))
+            cap['passes'].append(ps)
     cn0 = cap.pop('_cn0')
     try:
         cap['session'] = session_stats(cap, cn0)
     except Exception as e:      # the statistics are a summary; losing them must not lose the capture
         cap['session'], cap['session_error'] = None, str(e)
         print('%s: session statistics failed (%s)' % (cap['capture'], e))
+    garmin = analyze_garmin(stem, rows, cap)    # (a Garmin handheld recorded beside it: receiver.py's sidecar)
+    if garmin:
+        cap['garmin'] = garmin
     return cap
+
+
+def analyze_garmin(stem, rows, cap):
+    """the Garmin handheld recorded beside a GNSS capture (<capture>.garmin, written by garmin_usb.py while it
+    received) against our receiver, second by second and satellite by satellite (garmin_usb.compare); None without
+    one. Like the other raw files the .garmin goes after a week (storage.RAW_EXT) - a --redo then keeps the
+    comparison made while it was there. A comparison that fails is noted, never the capture lost."""
+    path = stem + '.garmin'
+    if not os.path.exists(path):
+        try:
+            with open(_cap_file(cap['capture'])) as f:
+                return json.load(f).get('garmin')
+        except (OSError, ValueError, AttributeError):
+            return None
+    try:
+        import garmin_usb
+        g, o = garmin_usb.LogReader(), garmin_usb.Ours()
+        with open(path, errors='replace') as f:
+            g.feed_text(f.read(), final=True)
+        o.feed_rows(rows)
+        return garmin_usb.compare(g, o, cap.get('system'), HOME)
+    except Exception as e:
+        log_error('comparing %s with the Garmin' % cap['capture'], e)
+        return {'error': '%s: %s' % (type(e).__name__, e)}
 
 
 def session_stats(cap, cn0=None):
@@ -571,7 +624,234 @@ def session_stats(cap, cn0=None):
         if q and q.get('enough'):
             s[key] = {k: round(q[k], 8 if k in ('lat', 'lon') else 2) for k in
                       ('lat', 'lon', 'height_m', 'r95_m', 'cep50_m', 'avg95_m', 'span_s', 'from_home_m') if k in q}
+    if cap.get('heard_not_tracked'):
+        s['heard_not_tracked'] = cap['heard_not_tracked']
+    try:        # the sky's signal map and lock table (the sky view): a summary - failing must not lose the rest
+        sky = sky_stats(cap)
+        if sky:
+            s.update(sky)
+    except Exception as e:
+        s['sky_error'] = '%s: %s' % (type(e).__name__, e)
     return s
+
+
+# ---------- GNSS passes kept compact, and what they say about the sky (2026-11-07)
+# A GNSS pass has a GCH line every second for hours. The catalog kept each second's Doppler - 21 of the 26 MB of the
+# GNSS catalog on 2026-11-07 - although no GNSS orbit is fitted from it (their orbits are the satellites' own broadcast
+# ones), and threw each second's C/N0 away. Now a pass keeps its Doppler every DOPPLER_STEP_S ('doppler_n': how many
+# seconds of tracking each point stands for, so counts of 'seconds heard' stay right) and its C/N0 every second in
+# CN0_STEP steps, packed (pack_cn0 / cn0_series). Passes catalogued before keep their 1 Hz Doppler and have no C/N0
+# (one 'catalog.py --redo' converts them while the capture's frames are still there).
+DOPPLER_STEP_S = 10
+CN0_STEP = 0.5                  # dB-Hz (pocket_trk prints 0.1, but its own C/N0 wanders by ~1 dB second to second)
+SCINT_WINDOW_S = 60             # the S4 index is defined over 60 s
+SCINT_MIN_S = 50                # ...a window needs this many seconds with C/N0
+SKY_CELL_DEG = 5                # the signal map's cells (elevation and azimuth)
+LOCK_BANDS = (10, 20, 30, 45, 60, 90)   # elevation bands of the lock table (deg; below 10 the solver ignores them)
+LOCK_STEP_S = 30                # the lock table looks at every satellite this often
+LOCK_NEAR_S = 15                # ...and counts it locked with a GCH line within this of the moment
+ORBIT_OK_KM = 300.0             # an orbit placed worse than this (1 sigma) is not used: ~1 deg seen from here
+
+
+def slim_pass(g):
+    """a GNSS pass's hits [(t, Hz, C/N0)] (sorted) -> its compact fields: 'doppler' [[t, Hz]] every DOPPLER_STEP_S (the
+    first line of each step), 'doppler_n' (seconds each point stands for), 'cn0' (every second, pack_cn0) and 'scint'
+    (scint_index, when the pass is long enough)"""
+    dop, dn, step = [], [], None
+    for t, hz, _ in g:
+        k = int(t // DOPPLER_STEP_S)
+        if k != step:
+            step = k
+            dop.append([round(t, 3), round(hz, 1)])
+            dn.append(0)
+        dn[-1] += 1
+    out = {'doppler': dop, 'doppler_n': dn, 'cn0': pack_cn0([(h[0], h[2]) for h in g])}
+    sc = scint_index(np.array([h[0] for h in g], float), np.array([h[2] for h in g], float))
+    if sc:
+        out['scint'] = sc
+    return out
+
+
+def pack_cn0(hits):
+    """[(t, C/N0)] sorted by time -> {'t0': first t, 'v': [...]}: one entry per second after t0, round(C/N0 / CN0_STEP),
+    and a run of k seconds without a line as -k (a pass may have holes of up to 15 minutes). 3-4 characters a second
+    in the catalog, where each second's Doppler took 22"""
+    if not hits:
+        return {'t0': 0, 'v': []}
+    t0 = hits[0][0]
+    v, last = [], -1
+    for t, c in hits:
+        k = int(round(t - t0))
+        if k <= last:
+            continue                # (two lines in one second: the first counts)
+        if k > last + 1:
+            v.append(-(k - last - 1))
+        v.append(max(1, int(round(c / CN0_STEP))))
+        last = k
+    return {'t0': round(t0, 3), 'v': v}
+
+
+def cn0_series(ps):
+    """a GNSS pass's C/N0 every second as numpy arrays (unix times, dB-Hz); empty for a pass catalogued before
+    C/N0 was kept"""
+    c = ps.get('cn0') if isinstance(ps, dict) else None
+    if not c or not c.get('v'):
+        return np.zeros(0), np.zeros(0)
+    v = np.asarray(c['v'], float)
+    gap = v < 0
+    step = np.where(gap, -v, 1.0)
+    pos = np.cumsum(step) - step        # seconds after t0 each entry starts at
+    return float(c['t0']) + pos[~gap], v[~gap] * CN0_STEP
+
+
+def scint_index(ts, cn0):
+    """an S4-like scintillation index from 1 Hz C/N0: per 60 s window (with 50+ seconds of C/N0), the standard deviation
+    of the signal power (C/N0 as linear intensity) after dividing out its straight-line trend (the slow rise and fall
+    with elevation and the antenna pattern). The true S4 uses 50 Hz power; pocket_trk's C/N0 is already averaged
+    over about a second, so fast scintillation is smoothed out, and its own estimation noise sets a floor that grows
+    as the signal gets weaker (see the measured values in the satellite info window's notes). Returns
+    {'s4': median over the windows, 's4_max', 'n': windows} or None"""
+    if len(ts) < SCINT_MIN_S:
+        return None
+    w = ((ts - ts[0]) // SCINT_WINDOW_S).astype(int)
+    edges = np.flatnonzero(np.diff(w)) + 1
+    vals = []
+    for idx in np.split(np.arange(len(ts)), edges):
+        if len(idx) < SCINT_MIN_S:
+            continue
+        tt = ts[idx] - ts[idx].mean()
+        ii = 10.0 ** (cn0[idx] / 10.0)
+        a, b = np.polyfit(tt, ii, 1)
+        trend = a * tt + b
+        if trend.min() <= 0:
+            continue
+        vals.append(float(np.std(ii / trend)))
+    if not vals:
+        return None
+    return {'s4': round(float(np.median(vals)), 3), 's4_max': round(max(vals), 3), 'n': len(vals)}
+
+
+def _sat_orbits(cap):
+    """satellite -> an orbit object (ecef(t) in km, sigma_km(t)) from the broadcast ephemerides OUR receiver decoded:
+    this capture's newest of each satellite, else the one the solver kept (gnss-solver.json, any session). Never a
+    public orbit: the sky map and lock table place satellites from what they sent us"""
+    import gnss
+    pool = dict(cap.get('ephemerides', {}))
+    try:
+        with open(os.path.join(paths.DATA, 'gnss-solver.json')) as f:
+            for sat, (t, text) in json.load(f).get('ephs', {}).items():
+                pool.setdefault(sat, [t, text])
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    out = {}
+    for sat, (t, fields) in pool.items():
+        try:
+            fields = fields.replace(' ', ',')
+            if fields.startswith('SBAS'):
+                o = gnss.SBASOrbit.from_fields(fields, sat, t)
+            elif fields.startswith('GLO'):
+                o = gnss.GlonassOrbit.from_fields(fields, sat, t)
+            else:
+                e = gnss.parse_eph('$EPH,%.3f,%s,%s' % (t, sat, fields))
+                if not e or e.get('svh', 0):        # (an unhealthy satellite may not be sending at all)
+                    continue
+                o = gnss.EphemerisOrbit(e)
+            out[sat] = o
+        except Exception:
+            continue
+    return out
+
+
+def _el_az(xyz_km):
+    """(n, 3) Earth-fixed positions (km) -> elevation, azimuth (deg) from home"""
+    lat, lon = HOME[0] * D2R, HOME[1] * D2R
+    d = np.asarray(xyz_km, float).reshape(-1, 3) - np.array(site(HOME[0], HOME[1], HOME[2]))
+    e = -math.sin(lon) * d[:, 0] + math.cos(lon) * d[:, 1]
+    n = -math.sin(lat) * math.cos(lon) * d[:, 0] - math.sin(lat) * math.sin(lon) * d[:, 1] + math.cos(lat) * d[:, 2]
+    u = math.cos(lat) * math.cos(lon) * d[:, 0] + math.cos(lat) * math.sin(lon) * d[:, 1] + math.sin(lat) * d[:, 2]
+    return np.degrees(np.arctan2(u, np.hypot(e, n))), np.degrees(np.arctan2(e, n)) % 360
+
+
+def sky_stats(cap):
+    """what a GNSS session says about the sky here, each satellite placed by its own broadcast orbit:
+      skymap  {'cell_deg', 'cells': [[el_row, az_col, seconds, median C/N0 / CN0_STEP]]} - how strong the signals
+              were in each 5 x 5 deg patch of sky (which directions are weak: antenna placement)
+      lock    {'step_s', 'bands', 'up', 'trk', 'no_orbit'} - GPS satellites only (whose orbits we nearly all have):
+              per elevation band x 8 compass sectors (N, NE, ...), how many LOCK_STEP_S moments a satellite was up
+              there and at how many of them it was tracked (the review's sky_cover.py table, per session)"""
+    if HOME is None:
+        return None
+    orbits = _sat_orbits(cap)
+    series = collections.defaultdict(list)
+    for ps in cap.get('passes', []):
+        ts, c = cn0_series(ps)
+        if len(ts):
+            series[ps['sat']].append((ts, c))
+    if not series:
+        return None
+    n_az = 360 // SKY_CELL_DEG
+    cells, vals = [], []
+    for sat, parts in series.items():
+        o = orbits.get(sat)
+        if o is None:
+            continue
+        ts = np.concatenate([p[0] for p in parts])
+        c = np.concatenate([p[1] for p in parts])
+        good = np.asarray(o.sigma_km(ts)) < ORBIT_OK_KM
+        if not good.any():
+            continue
+        ts, c = ts[good], c[good]
+        el, az = _el_az(o.ecef(ts))
+        up = el >= 0
+        cells.append((np.minimum(el[up], 89.999) // SKY_CELL_DEG).astype(int) * n_az +
+                     (az[up] // SKY_CELL_DEG).astype(int) % n_az)
+        vals.append(c[up])
+    out = {}
+    if cells:
+        cell, val = np.concatenate(cells), np.concatenate(vals)
+        order = np.lexsort((val, cell))
+        cell, val = cell[order], val[order]
+        cut = np.flatnonzero(np.diff(cell)) + 1
+        rows = []
+        for a, b in zip(np.r_[0, cut], np.r_[cut, len(cell)]):
+            if b <= a:
+                continue
+            k = int(cell[a])
+            rows.append([k // n_az, k % n_az, int(b - a), int(round(float(np.median(val[a:b])) / CN0_STEP))])
+        out['skymap'] = {'cell_deg': SKY_CELL_DEG, 'cells': rows}
+    # the lock table: the GPS satellites we have an orbit of our own for, every LOCK_STEP_S over the session
+    t_lo = min(float(p[0][0]) for parts in series.values() for p in parts)
+    t_hi = max(float(p[0][-1]) for parts in series.values() for p in parts)
+    if cap.get('system') == 'gnss1' and t_hi - t_lo >= 300:
+        grid = np.arange(t_lo, t_hi, float(LOCK_STEP_S))
+        nb = len(LOCK_BANDS) - 1
+        up_n, trk_n = np.zeros((nb, 8), int), np.zeros((nb, 8), int)
+        no_orbit = 0
+        for k in range(1, 33):
+            sat = 'G%02d' % k
+            o = orbits.get(sat)
+            good = np.asarray(o.sigma_km(grid)) < ORBIT_OK_KM if o is not None else np.zeros(len(grid), bool)
+            if not good.any():
+                no_orbit += 1
+                continue
+            g = grid[good]
+            el, az = _el_az(o.ecef(g))
+            band = np.searchsorted(LOCK_BANDS, el, side='right') - 1
+            ok = (band >= 0) & (band < nb)
+            if not ok.any():
+                continue
+            sector = (((az + 22.5) % 360) // 45).astype(int) % 8
+            heard_ts = np.sort(np.concatenate([p[0] for p in series[sat]])) if sat in series else np.zeros(0)
+            if len(heard_ts):
+                i = np.minimum(np.searchsorted(heard_ts, g - LOCK_NEAR_S), len(heard_ts) - 1)
+                near = (heard_ts[i] >= g - LOCK_NEAR_S) & (heard_ts[i] < g + LOCK_NEAR_S)
+            else:
+                near = np.zeros(len(g), bool)
+            np.add.at(up_n, (band[ok], sector[ok]), 1)
+            np.add.at(trk_n, (band[ok & near], sector[ok & near]), 1)
+        out['lock'] = {'step_s': LOCK_STEP_S, 'bands': list(LOCK_BANDS), 'up': up_n.tolist(), 'trk': trk_n.tolist(),
+                       'no_orbit': no_orbit}
+    return out
 
 
 GNSS_L1 = 1575.42e6

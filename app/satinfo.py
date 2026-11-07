@@ -3,6 +3,7 @@
   About         what it is: block, launch, hardware, and how your receiver identified it
   Doppler curve each pass's measured frequency shift, with the predicted curve it was matched to
   Heard         every pass your antenna picked it up
+  Signal        (GNSS) its signal strength against its height in your sky, and a scintillation index per pass
   Orbit         our own orbit for it (from your observations), compared with the public catalog
 
 The public catalog (CelesTrak) is used here for reference facts and to explain identification only;
@@ -154,6 +155,32 @@ DOPPLER_HELP = (
     'slower, only about &plusmn;4-5 kHz at 1575 MHz, over hours. Every satellite\'s pass over you has its own curve, so matching the measured '
     'points to the predicted curves identifies which satellite you heard - and the curves also help fit '
     'our own orbit.')
+
+
+SIGNAL_HELP = (
+    '<b>Signal against elevation:</b> C/N0 (carrier to noise density, dB-Hz) is how strong a satellite\'s signal is '
+    'at your receiver. It normally rises as the satellite climbs - less air, and most antennas hear best upwards - '
+    'and is weaker where something blocks or shades the antenna. Every second your receiver tracked it is a dot, '
+    'placed by the satellite\'s own broadcast orbit; the line is the middle value per 5&deg; of elevation over all '
+    'passes. <b>S4-like index:</b> how much the signal power flickers within each minute, after its slow rise and '
+    'fall is taken out (std / mean of the power). True S4 (ionospheric scintillation) uses 50 samples a second; '
+    'this one comes from the receiver\'s 1 Hz C/N0, which is itself averaged, so it sees only slow fading and has '
+    'a floor from the C/N0 estimate\'s own noise - measured on 11 290 minutes of passes here (Nov 2026, quiet '
+    'sky): about 0.05 at 42-45 dB-Hz, 0.07 at 33-42 and 0.12 at 30-33 dB-Hz. Clearly higher values mean real '
+    'fading: reflections coming and going (multipath, mostly at low elevation) or, rarely at this latitude, '
+    'scintillation.')
+# the S4-like index's floor by signal level (median over the passes of 2026-11-02..06; s4_floor.py)
+S4_FLOOR = [(42, 0.05), (33, 0.075), (30, 0.12), (0, 0.13)]
+
+
+def s4_floor(cn0):
+    return next(f for lo, f in S4_FLOOR if cn0 >= lo)
+
+
+def _split_passes(ts, c, gap_s=900):
+    """one capture's seconds of C/N0 -> its passes (split where it was not heard for 15 minutes, as catalog.py does)"""
+    cut = np.flatnonzero(np.diff(ts) > gap_s) + 1
+    return list(zip(np.split(ts, cut), np.split(c, cut)))
 
 
 # ---------------------------------------------------------------- public catalog helpers
@@ -375,6 +402,77 @@ class DopplerPlot(QtWidgets.QWidget):
             y0 += 16
 
 
+class SignalPlot(QtWidgets.QWidget):
+    """a GNSS satellite's C/N0 against its elevation: every pass faint, the chosen pass bright, and the middle value
+    per 5 degrees of elevation over all passes as a line"""
+    EL0, EL1, C0, C1 = 0.0, 90.0, 15.0, 55.0
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumHeight(260)
+        self.all = self.sel = self.med = None
+        self.note = 'No C/N0 recorded for this satellite yet.'
+
+    def set_data(self, all_pts, sel, med, note=''):
+        self.all, self.sel, self.med, self.note = all_pts, sel, med, note
+        self.update()
+
+    def paintEvent(self, _):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        p.fillRect(self.rect(), QtGui.QColor('#14171c'))
+        font = p.font()
+        font.setPointSize(8)
+        p.setFont(font)
+        if self.all is None or not len(self.all[0]):
+            p.setPen(QtGui.QColor(MUTED))
+            p.drawText(self.rect(), Qt.AlignCenter | Qt.TextWordWrap, self.note)
+            return
+        L, R, T, B = 50, 14, 14, 30
+        w, h = self.width() - L - R, self.height() - T - B
+        X = lambda el: L + (el - self.EL0) / (self.EL1 - self.EL0) * w
+        Y = lambda c: T + (self.C1 - np.clip(c, self.C0, self.C1)) / (self.C1 - self.C0) * h
+        for c in range(20, 55, 5):
+            p.setPen(QtGui.QPen(QtGui.QColor(GRID), 1))
+            p.drawLine(QPointF(L, Y(c)), QPointF(L + w, Y(c)))
+            p.setPen(QtGui.QColor(MUTED))
+            p.drawText(QtCore.QRectF(0, Y(c) - 8, L - 6, 16), Qt.AlignRight | Qt.AlignVCenter, '%d' % c)
+        for el in range(0, 91, 15):
+            p.setPen(QtGui.QPen(QtGui.QColor(GRID), 1))
+            p.drawLine(QPointF(X(el), T), QPointF(X(el), T + h))
+            p.setPen(QtGui.QColor(MUTED))
+            p.drawText(QtCore.QRectF(X(el) - 30, T + h + 4, 60, 14), Qt.AlignCenter, '%d\u00b0' % el)
+        p.save()
+        p.translate(12, T + h / 2)
+        p.rotate(-90)
+        p.drawText(QtCore.QRectF(-80, -8, 160, 16), Qt.AlignCenter, 'C/N0 (dB-Hz)')
+        p.restore()
+        p.drawText(QtCore.QRectF(L, T + h + 15, w, 14), Qt.AlignCenter, 'elevation (its own orbit)')
+        p.setPen(Qt.NoPen)
+        p.setBrush(QtGui.QColor(150, 160, 175, 60))
+        for el, c in zip(*self.all):
+            p.drawEllipse(QPointF(X(el), Y(c)), 1.6, 1.6)
+        if self.sel is not None and len(self.sel[0]):
+            p.setBrush(C_MEASURED)
+            for el, c in zip(*self.sel):
+                p.drawEllipse(QPointF(X(el), Y(c)), 2.0, 2.0)
+        if self.med is not None and len(self.med[0]) > 1:
+            path = QtGui.QPainterPath(QPointF(X(self.med[0][0]), Y(self.med[1][0])))
+            for el, c in zip(self.med[0][1:], self.med[1][1:]):
+                path.lineTo(X(el), Y(c))
+            p.setPen(QtGui.QPen(C_OURS, 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(path)
+        y0 = T + 8
+        for col, lab in ((C_MEASURED, 'this pass, every second'), (QtGui.QColor(150, 160, 175), 'all its passes'),
+                         (C_OURS, 'middle value per 5\u00b0')):
+            p.setPen(QtGui.QPen(col, 2))
+            p.drawLine(QPointF(L + w - 170, y0 + 6), QPointF(L + w - 154, y0 + 6))
+            p.setPen(QtGui.QColor(TEXT))
+            p.drawText(QPointF(L + w - 148, y0 + 10), lab)
+            y0 += 16
+
+
 # ---------------------------------------------------------------- the window
 def _facts(rows):
     return '<table cellspacing="0" cellpadding="3">%s</table>' % ''.join(
@@ -413,6 +511,27 @@ class SatInfoDialog(QtWidgets.QDialog):
         help_.setWordWrap(True)
         dl.addWidget(help_)
         self.tabs.addTab(dop, 'Doppler curve')
+
+        sig = QtWidgets.QWidget()           # GNSS: signal against elevation, scintillation
+        sl = QtWidgets.QVBoxLayout(sig)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel('Pass:'))
+        self.sig_box = QtWidgets.QComboBox()
+        self.sig_box.currentIndexChanged.connect(self._show_signal)
+        row.addWidget(self.sig_box, 1)
+        sl.addLayout(row)
+        self.sig_plot = SignalPlot()
+        sl.addWidget(self.sig_plot, 1)
+        self.sig_text = QtWidgets.QLabel()
+        self.sig_text.setWordWrap(True)
+        self.sig_text.setTextFormat(Qt.RichText)
+        sl.addWidget(self.sig_text)
+        help_ = QtWidgets.QLabel('<span style="color:%s">%s</span>' % (MUTED, SIGNAL_HELP))
+        help_.setWordWrap(True)
+        sl.addWidget(help_)
+        self.sig_tab = self.tabs.addTab(sig, 'Signal')
+        self.sig_passes = []
+        self.sig_all = None
 
         heard = QtWidgets.QWidget()
         hl = QtWidgets.QVBoxLayout(heard)
@@ -471,6 +590,7 @@ class SatInfoDialog(QtWidgets.QDialog):
                               .replace('tracked', 'its own ranging code')))
         self._fill_about()
         self._fill_doppler()
+        self._fill_signal()
         self._fill_heard()
         self._fill_orbit()
 
@@ -591,9 +711,12 @@ class SatInfoDialog(QtWidgets.QDialog):
         d, name = self.tracker.data, self.name
         if self.system is not systems.IRIDIUM:      # Orbcomm packets / ham frames: every one's frequency
             kind = {'orbcomm': 'packets', 'gnss': 'tracking'}.get(self.system['key'], 'frames')
-            out = [(kind, list(g))
+            out = [(kind, list(g), d.curve_weights(g) if hasattr(d, 'curve_weights') else None)
                    for g in d.doppler.get(name, []) if len(g) >= 2]
-            return sorted(out, key=lambda c: -max(t for t, _ in c[1]))
+            out.sort(key=lambda c: -max(t for t, _ in c[1]))
+            self.curve_w = [w for _, _, w in out]       # (seconds each point stands for, or None: one each)
+            return [(k, g) for k, g, _ in out]
+        self.curve_w = []
         out = [('time & location frames', list(g)) for g in d.doppler.get(name, []) if len(g) >= 2]
         by_cap = {}
         for f in d.all_fixes():
@@ -657,10 +780,14 @@ class SatInfoDialog(QtWidgets.QDialog):
 
     def _fill_heard(self):
         d, name = self.tracker.data, self.name
-        obs = [(t, 'frame', None) for kind, g in self.curves if kind in ('time & location frames', 'packets', 'frames', 'tracking')
-               for t, _ in g]
+        cw = getattr(self, 'curve_w', [])
+        obs = [(t, 'frame', None, w[j] if w is not None and j < len(w) else 1)
+               for i, (kind, g) in enumerate(self.curves)
+               if kind in ('time & location frames', 'packets', 'frames', 'tracking')
+               for w in [cw[i] if i < len(cw) else None]
+               for j, (t, _) in enumerate(g)]
         fixes = [f for f in d.all_fixes() if f['name'] == name]
-        obs += [(f['t'], 'fix', f) for f in fixes]
+        obs += [(f['t'], 'fix', f, 1) for f in fixes]
         obs.sort(key=lambda o: o[0])
         passes, cur = [], []
         for o in obs:
@@ -683,7 +810,7 @@ class SatInfoDialog(QtWidgets.QDialog):
             if self.orbit is not None:
                 tt = np.linspace(t0, max(t1, t0 + 1), 30)
                 high = float(it.from_home(*self.orbit.ecef(tt).T)[0].max())
-            vals = [it.fmt_time(t0), _dur(t1 - t0), str(sum(1 for o in ps if o[1] == 'frame')), str(len(fx)),
+            vals = [it.fmt_time(t0), _dur(t1 - t0), str(sum(o[3] for o in ps if o[1] == 'frame')), str(len(fx)),
                     '%.0f dB' % best if best else '-', '%.0f°' % high if high is not None else '-']
             for c, v in enumerate(vals):
                 tb.setItem(r, c, QtWidgets.QTableWidgetItem(v))
@@ -691,6 +818,103 @@ class SatInfoDialog(QtWidgets.QDialog):
         self.heard_note.setText('<span style="color:%s">%d pass%s heard. Double-click one to jump the timeline '
                                 'to it. "Highest heard" is how high it was while you heard it, from our own orbit '
                                 '(when we have one).</span>' % (MUTED, len(passes), '' if len(passes) == 1 else 'es'))
+
+    def signal_passes(self):
+        """[(label, times, C/N0, scintillation or None)] of a GNSS satellite, newest first: its catalogued passes (C/N0
+        every second since 2026-11-07) and the ones of captures still being received"""
+        d, name = self.tracker.data, self.name
+        out = []
+        for ps in getattr(d, 'gnss_passes', {}).get(name, []):
+            ts, c = catalog.cn0_series(ps)
+            if len(ts) >= 2:
+                out.append(('', ts, c, ps.get('scint')))
+        for (cap, n), g in list(getattr(d, 'live_cn0', {}).items()):
+            if n != name or len(g) < 2:
+                continue
+            arr = np.array(g, float)
+            for ts, c in _split_passes(arr[:, 0], arr[:, 1]):
+                if len(ts) >= 2:
+                    out.append((' (receiving)', ts, c, catalog.scint_index(ts, c)))
+        return sorted(out, key=lambda x: -x[1][-1])
+
+    def _elevations(self, ts):
+        """elevation (deg) at times ts from the satellite's own orbit, NaN where it is not good to ~1 deg"""
+        o = self.orbit
+        if o is None or not len(ts):
+            return np.full(len(ts), np.nan)
+        import iridium_tracker as it
+        el = it.from_home(*np.asarray(o.ecef(ts), float).reshape(-1, 3).T)[0]
+        return np.where(np.asarray(o.sigma_km(ts)) < catalog.ORBIT_OK_KM, el, np.nan)
+
+    def _fill_signal(self):
+        gnss = self.system is systems.GNSS
+        if hasattr(self.tabs, 'setTabVisible'):
+            self.tabs.setTabVisible(self.sig_tab, gnss)
+        else:
+            self.tabs.setTabEnabled(self.sig_tab, gnss)
+        self.sig_passes = self.signal_passes() if gnss else []
+        self.sig_box.blockSignals(True)
+        self.sig_box.clear()
+        for label, ts, c, sc in self.sig_passes:
+            self.sig_box.addItem('%s  \u00b7  %s long  \u00b7  median %.1f dB-Hz%s%s' % (
+                self.tracker_fmt(ts[0]), _dur(ts[-1] - ts[0]), float(np.median(c)),
+                '  \u00b7  S4-like %.2f' % sc['s4'] if sc else '', label))
+        self.sig_box.blockSignals(False)
+        # every pass's seconds against elevation (at most ~6000 dots drawn), and the middle per 5 degrees
+        els, cs = [], []
+        for _, ts, c, _ in self.sig_passes:
+            el = self._elevations(ts)
+            ok = ~np.isnan(el)
+            els.append(el[ok])
+            cs.append(c[ok])
+        self.sig_all = None
+        self.sig_bands = []
+        if els and sum(len(e) for e in els):
+            el, c = np.concatenate(els), np.concatenate(cs)
+            band = (np.clip(el, 0, 89.9) // 5).astype(int)
+            mid = [(b * 5 + 2.5, float(np.median(c[band == b]))) for b in range(18) if (band == b).sum() >= 30]
+            self.sig_bands = mid
+            k = subsample(np.arange(len(el)), 6000)
+            self.sig_all = ((el[k], c[k]), (np.array([m[0] for m in mid]), np.array([m[1] for m in mid])))
+        self._show_signal(0)
+
+    def _show_signal(self, idx):
+        if self.system is not systems.GNSS:
+            return
+        if not self.sig_passes or idx < 0:
+            self.sig_plot.set_data(None, None, None, 'No C/N0 recorded for this satellite yet (passes catalogued '
+                                                     'before 2026-11-07 kept none - catalog.py --redo adds it).')
+            self.sig_text.setText('')
+            return
+        _, ts, c, sc = self.sig_passes[idx]
+        el = self._elevations(ts)
+        ok = ~np.isnan(el)
+        lines = ['This pass: median <b>%.1f dB-Hz</b> (best %.1f) over %s, %d seconds tracked%s.' % (
+            float(np.median(c)), float(c.max()), _dur(ts[-1] - ts[0]), len(ts),
+            ', elevation %.0f-%.0f&deg;' % (np.nanmin(el), np.nanmax(el)) if ok.any() else '')]
+        if sc:
+            floor = s4_floor(float(np.median(c)))
+            verdict = ('at the level the C/N0 estimate\'s own noise gives - no sign of fading'
+                       if sc['s4'] < 1.5 * floor else
+                       'above the noise floor (~%.2f at this signal level) - the signal faded in and out: '
+                       'reflections (multipath), something partly in the way, or scintillation' % floor)
+            lines.append('S4-like index from 1 Hz C/N0: median <b>%.2f</b>, highest minute %.2f (%d minutes) - %s.'
+                         % (sc['s4'], sc['s4_max'], sc['n'], verdict))
+        else:
+            lines.append('<span style="color:%s">Too short for the S4-like index (it needs a minute with 50+ seconds '
+                         'of C/N0).</span>' % MUTED)
+        if self.sig_bands:
+            lines.append('All its passes by elevation: ' + ', '.join(
+                '%.0f-%.0f&deg; %.0f' % (m - 2.5, m + 2.5, v) for m, v in self.sig_bands[::2]) + ' dB-Hz.')
+        if self.orbit is None:
+            lines.append('<span style="color:%s">No broadcast orbit of its own decoded yet - the dots need it to know '
+                         'how high the satellite was.</span>' % MUTED)
+        self.sig_text.setText('<br>'.join(lines))
+        if self.sig_all is None:
+            self.sig_plot.set_data(None, None, None, 'No elevations: this satellite\'s own orbit is not known (or not '
+                                                     'good enough) for these times.')
+        else:
+            self.sig_plot.set_data(self.sig_all[0], (el[ok], c[ok]), self.sig_all[1])
 
     def _go_to_pass(self, row, _col):
         ps = self.heard_passes[row]
@@ -703,10 +927,12 @@ class SatInfoDialog(QtWidgets.QDialog):
         o, now = self.orbit, self.tracker.t
         if o is None:
             why = self.tracker.data.no_orbit.get(self.name, '')
+            alm = self._almanac_rows(now, None, None) if self.system is systems.GNSS else []
             self.orbit_text.setHtml('<h3>No orbit of our own yet</h3><p>%s</p><p style="color:%s">Our orbits come only '
                                     'from your own observations: positions it reported (Iridium ring alerts, Orbcomm '
-                                    'ephemeris), its own broadcast orbit (GPS / Galileo), and Doppler curves.</p>'
-                                    % ('Reason: %s.' % why if why else '', MUTED))
+                                    'ephemeris), its own broadcast orbit (GPS / Galileo), and Doppler curves.</p>%s'
+                                    % ('Reason: %s.' % why if why else '', MUTED,
+                                       ('<h3>Its almanac (rough - not drawn)</h3>%s' % _facts(alm)) if alm else ''))
             return
         node, inc = o.plane_at(now)
         a = o.p[4]
@@ -745,21 +971,63 @@ class SatInfoDialog(QtWidgets.QDialog):
                                 'account, fitted to your fixes and Doppler curves. The catalog is only used here as a '
                                 'check.</p>' % (_facts(rows), _facts(comp) if comp else '<p>Not in the catalog.</p>', MUTED))
 
+    def _almanac_rows(self, now, o, np_):
+        """its almanac (every GPS / Galileo satellite sends the whole constellation's): a rough orbit, good to a few
+        km - shown here as a check and for the next pass when its own orbit can't give one; never drawn"""
+        import iridium_tracker as it
+        sat = self.info.get('sat') or self.name.split()[-1]
+        try:
+            al = self.tracker.data.almanac_orbit(sat, now)
+        except Exception:
+            al = None
+        if al is None:
+            return []
+        sig = float(al.sigma_km(now)[0])
+        rows = [('Almanac', 'reference time %s, received %s; good to about %s now%s' % (
+            it.fmt_time(al.t0), it.fmt_time(al.info['received']), it.fmt_sigma(sig),
+            '' if not al.info.get('health') else ' - it says this satellite is unhealthy / not in service'))]
+        if o is not None:
+            d = float(np.linalg.norm(al.ecef(now)[0] - o.ecef(now)[0]))
+            rows.append(('Almanac vs its orbit', '%.1f km apart now' % d))
+        if o is None or np_ is None:
+            try:
+                ap = _almanac_pass(al, now)
+            except Exception:
+                ap = None
+            rows.append(('Next pass (almanac)', 'none in the next 36 h' if ap is None else
+                         'now (up to %.0f&deg;)' % ap[2] if ap[3] else
+                         '%s, up to %.0f&deg; (%s: from the almanac)' % (it.fmt_time(ap[0]), ap[2],
+                                                                               it.fmt_sigma(sig))))
+        return rows
+
     def _fill_orbit_gnss(self, o, now, inc, a, np_):
         """a GNSS satellite's orbit: its own broadcast ephemeris, checked against the public catalog"""
         import iridium_tracker as it
         oi, e = o.info, o.eph
+        # with the archive (gnss.archive_orbit) each moment uses the ephemeris with the nearest reference time: the
+        # one shown is the one in use at the timeline's time
+        used = o.member_at(now) if hasattr(o, 'member_at') else o
+        ui = used.info
         rows = [('Source', 'its own broadcast orbit (ephemeris), decoded from its signal by PocketSDR'),
                 ('Height', '%.0f km' % (a - 6371.0)),
                 ('Inclination', '%.2f&deg;' % math.degrees(inc)),
-                ('Eccentricity', '%.4f' % e['e']),
+                ('Eccentricity', '%.4f' % (used.eph or e)['e']),
                 ('Period', '%.2f min' % o.period_min),
-                ('Reference time', '%s (good to a few metres for about 2 hours either side)' % it.fmt_time(oi['toe'])),
-                ('Received', it.fmt_time(oi['last_obs'])),
-                ('Health', 'OK' if not oi.get('health') else 'marked unhealthy by the satellite'),
-                ('Uncertainty now', '%s (at %s)' % (it.fmt_sigma(float(o.sigma_km(now)[0])), it.fmt_time(now))),
-                ('Next pass', 'not within the time our orbit is good for' if np_ is None else
-                 'now (up to %.0f&deg;)' % np_[2] if np_[3] else '%s, up to %.0f&deg;' % (it.fmt_time(np_[0]), np_[2]))]
+                ('Reference time', '%s (good to a few metres for about 2 hours either side)%s' % (
+                    it.fmt_time(ui['toe']), ' - the one nearest %s' % it.fmt_time(now) if oi.get('archive') else '')),
+                ('Received', it.fmt_time(ui['last_obs'])),
+                ('Health', 'OK' if not ui.get('health') else 'marked unhealthy by the satellite')]
+        if ui.get('accuracy_m'):
+            rows.append(('Its own accuracy forecast', '%.2f m of range (%s)' % (
+                ui['accuracy_m'], 'SISA' if oi.get('sat', ' ')[0] == 'E' else 'URA')))
+        if oi.get('archive'):
+            rows.append(('Orbit history', '%d broadcast orbits kept, reference times %s to %s - each moment of the '
+                         'timeline is drawn with the nearest one' % (oi['archive'], it.fmt_time(oi['archive_first_toe']),
+                                                                    it.fmt_time(oi['archive_last_toe']))))
+        rows += [('Uncertainty now', '%s (at %s)' % (it.fmt_sigma(float(o.sigma_km(now)[0])), it.fmt_time(now))),
+                 ('Next pass', 'not within the time our orbit is good for' if np_ is None else
+                  'now (up to %.0f&deg;)' % np_[2] if np_[3] else '%s, up to %.0f&deg;' % (it.fmt_time(np_[0]), np_[2]))]
+        rows += self._almanac_rows(now, o, np_)
         comp = []
         sat = next((s for s in self.sats if s.name == self.cat_name), None)
         if sat is not None:
@@ -773,6 +1041,20 @@ class SatInfoDialog(QtWidgets.QDialog):
                                 '<p style="color:%s">The broadcast orbit is what every GPS / Galileo receiver uses '
                                 'to work out its position. The catalog is only used here as a check.</p>'
                                 % (_facts(rows), _facts(comp) if comp else '<p>Not matched to the catalog.</p>', MUTED))
+
+
+def _almanac_pass(orbit, t0):
+    """(rise, set, max elevation, up now) of the next pass above MIN_EL within 36 h from an almanac, as
+    iridium_tracker.next_pass does for real orbits; None if none"""
+    import iridium_tracker as it
+    tt = t0 + np.arange(0, 36 * 3600, 30.0)
+    el = it.from_home(*orbit.ecef(tt).T)[0]
+    up = el >= it.MIN_EL
+    if not up.any():
+        return None
+    i = int(np.argmax(up))
+    j = i + int(np.argmax(~up[i:])) if (~up[i:]).any() else len(tt) - 1
+    return float(tt[i]), float(tt[j]), float(el[i:j + 1].max()), i == 0
 
 
 def _dur(s):

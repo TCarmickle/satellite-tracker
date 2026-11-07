@@ -33,6 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import paths     # noqa: E402  (where the data lives)
 import catalog   # noqa: E402  (capture reading, satellite names)
+import gnss_lines  # noqa: E402  (the GNSS receiver's line formats)
 import storage   # noqa: E402  (keeping the data small)
 import data_dialog  # noqa: E402
 import lights  # noqa: E402
@@ -306,6 +307,14 @@ def fmt_clock(t):
 GNSS_TRACK_S = 5        # consecutive seconds of GCH lines at GNSS_TRACK_CN0+ before a satellite counts as tracked
 GNSS_TRACK_CN0 = 25.0   # (55 of 302 catalogued passes were under 10 s, one a single line at 14 dB-Hz for a satellite
 #                         below the horizon: pocket_trk's false locks); a decoded orbit says 'tracked' at once
+# Galileo's weak E1B locks came and went every 10-30 s in week 1 (a TRACKING/LOST pair each time): its own, higher
+# bar. A decoded orbit still says 'tracked' at once.
+GNSS_TRACK_BY_SYSTEM = {'E': (10, 30.0)}
+
+
+def gnss_track_gate(sat):
+    """(seconds, dB-Hz) a satellite must hold before it counts as tracked"""
+    return GNSS_TRACK_BY_SYSTEM.get(sat[:1], (GNSS_TRACK_S, GNSS_TRACK_CN0))
 GNSS_LOST_S = 10        # no GCH line for this long: the satellite is lost (the panel's own rule too)
 FIX_LOST_S = 30         # no fix line for this long: the fix is lost (one FIX LOST event, not one per missing second)
 FIX_OLD_S = 60          # the headline goes grey ('No fix for ...') when the own solver's last fix is older than this
@@ -446,6 +455,9 @@ class Data:
         self._ham_names = None  # NORAD number -> catalog name, for ham satellites
         self._ham_fits = {}     # ham satellite -> (data size, time) of its last Doppler-only fit
         self.gnss_eph = {}      # GNSS satellite id (G05...) -> (time, its newest broadcast ephemeris fields)
+        self.gnss_archive = {}  # ...-> {gnss.archive_key: (time, fields)}: every ephemeris it sent (nearest per moment)
+        self.gnss_alm = {}      # ...-> (time, GALM fields): its newest almanac (rough: 'Up but not heard' and passes)
+        self._alm_orbits = {}   # sat -> (fields, gnss.AlmanacOrbit) built from gnss_alm
         self.gnss_fixes = []    # GNSS position fixes of the receiver itself (pocket_trk's)
         self.gnss_spp = []      # ...and our own WAAS-corrected, carrier-smoothed ones (spp.py)
         self.gnss_sessions = []     # each GNSS L1 capture's session stats (catalog.session_stats), oldest first
@@ -459,6 +471,14 @@ class Data:
         self.link_tried = {}    # (capture, (plane, slot)) -> (time tried, frames then)
         self.links_version = 0  # goes up when a plane/slot gets linked (the satellite list needs updating)
         self.live_doppler = {}  # (capture, name) -> Doppler curve [(t, Hz), ...]
+        self.live_cn0 = {}      # (capture, name) -> a GNSS satellite's C/N0 every second, [(t, dB-Hz), ...] (info window)
+        # catalog GNSS passes keep a Doppler point every 10 s (catalog.slim_pass): id(curve) -> (curve, seconds each point
+        # stands for), so the sky view counts seconds heard, not points (curve_weights)
+        self.curve_n = {}
+        self.gnss_passes = {}   # GNSS name -> its catalogued passes (C/N0 every second, scintillation; never changed here)
+        self.gnss_sky = []      # (start, end, session stats, capture) of GNSS captures with a sky map / lock table
+        self.gnss_heard = {}    # sat id -> {'t', 'cn0', 'dop', 'first'}: heard by gnss_rx's own search (GHEARD lines)
+        #                         while pocket_trk was not tracking it - listed as such, never a position or an orbit
         self.heartbeat = 0      # last time the newest capture's files changed (its decoder log: every 10 s)
         self.last_burst = 0     # last time that capture received a burst
         # GNSS live state (the newest capture only): which satellites count as tracked, the fixes' state - the
@@ -491,6 +511,19 @@ class Data:
         return self._tles[system]
 
     SIGNAL_KEEP_S = 600
+    HEARD_EVENT_S = 600         # a 'heard, not tracked' satellite gets an event line again after this long unheard
+    HEARD_SHOW_S = 150          # ...and is shown as such while its last GHEARD (one search a minute) is this recent
+
+    def curve_weights(self, g):
+        """how many seconds of tracking each point of Doppler curve g stands for (catalog GNSS passes keep one point
+        every 10 s), or None: one each"""
+        got = self.curve_n.get(id(g))
+        return got[1] if got is not None and got[0] is g else None
+
+    def heard_not_tracked(self, now):
+        """{sat id: GHEARD info} heard by our own search in the last HEARD_SHOW_S and not tracked now"""
+        return {s: h for s, h in self.gnss_heard.items()
+                if now - h['t'] <= self.HEARD_SHOW_S and s not in self.gnss_tracking}
 
     def heard(self, name, t, value=None):
         """a satellite heard at t, with its signal (SNR dB, or C/N0 dB-Hz for GNSS)"""
@@ -643,21 +676,66 @@ class Data:
 
     def _gnss_orbit(self, n):
         """GNSS satellites broadcast their own orbit (ephemeris): its position comes from that, like Orbcomm's
-        reported positions - only once it has been decoded (needs ~30 s of continuous tracking)"""
+        reported positions - only once it has been decoded (needs ~30 s of continuous tracking). Every ephemeris it
+        sent is kept (gnss_archive), and each moment is drawn with the one whose reference time is nearest - a
+        timeline scrubbed to yesterday uses yesterday's (gnss.archive_orbit); WAAS (its message type 9) and GLONASS
+        (its integrated position / velocity) the same way."""
         sat = self.info.get(n, {}).get('sat')
         got = self.gnss_eph.get(sat)
         if not got:
             return None, 'its broadcast orbit (ephemeris) has not been decoded yet - needs about 30 s of steady tracking'
         try:
             import gnss
-            t, fields = got
-            if fields.startswith('SBAS'):       # a WAAS satellite: its own position from its message type 9
-                return gnss.SBASOrbit.from_fields(fields, sat, t), None
-            if fields.startswith('GLO'):        # GLONASS: its own position / velocity, integrated
-                return gnss.GlonassOrbit.from_fields(fields, sat, t), None
-            return gnss.EphemerisOrbit(gnss.parse_eph('$EPH,%.3f,%s,%s' % (t, sat, fields.replace(' ', ',')))), None
+            kept = list(self.gnss_archive.get(sat, {}).values()) or [got]
+            return gnss.archive_orbit(sat, kept), None
         except Exception as e:      # (gnss.py missing, or an ephemeris it can't read)
             return None, 'could not use its ephemeris (%s)' % e
+
+    def _archive_eph(self, sat, t, fields):
+        import gnss
+        try:
+            key = gnss.archive_key(fields)
+        except (ValueError, IndexError):
+            return
+        d = self.gnss_archive.setdefault(sat, {})
+        if t >= d.get(key, (0, ''))[0]:
+            d[key] = (t, fields)
+
+    def _keep_alm(self, sat, t, fields):
+        """a satellite's almanac (GALM): the one with the newest reference time is kept"""
+        import nav_bits
+        a = nav_bits.parse_alm(fields)
+        if a is None:
+            return
+        old = self.gnss_alm.get(sat)
+        key = lambda a: a['t0'] if a['sys'] == 'S' else a['toa_gpst']
+        if old is None or key(a) >= key(nav_bits.parse_alm(old[1]) or a):
+            self.gnss_alm[sat] = (t, fields)
+
+    def _nav_param(self, key, t, fields):
+        """GALM UTCG / UTCE: the leap seconds the satellites announce (gnss.set_utc; the built-in table otherwise)"""
+        if key in ('UTCG', 'UTCE'):
+            import gnss
+            import nav_bits
+            p = nav_bits.parse_utc_text(fields)
+            if p:
+                gnss.set_utc(p, t)
+
+    def almanac_orbit(self, sat, t=None):
+        """a satellite's almanac as a rough orbit (gnss.AlmanacOrbit, km-level - never drawn as its orbit), or
+        None when there is none within gnss.ALM_KEEP_DAYS of time t (now)"""
+        got = self.gnss_alm.get(sat)
+        if not got:
+            return None
+        cached = self._alm_orbits.get(sat)
+        if cached is None or cached[0] != got[1]:
+            try:
+                import gnss
+                cached = self._alm_orbits[sat] = (got[1], gnss.AlmanacOrbit(got[1], sat, got[0]))
+            except Exception:       # (a line it can't read: no almanac for it)
+                return None
+        o = cached[1]
+        return o if o.usable(time.time() if t is None else t) else None
 
     def _fit_ham(self, n, groups):
         """ISS / ham satellites send no position: an orbit from their Doppler curves alone, kept only if
@@ -740,7 +818,9 @@ class Data:
                        set(self.live_links.values()))
         self.captures, self.fixes = [], []
         self.gnss_eph, self.gnss_fixes, self.gnss_spp, self.gnss_sessions = {}, [], [], []
+        self.gnss_archive, self.gnss_alm = {}, {}
         self.doppler = {}       # name -> list of Doppler curves [(t, Hz), ...]
+        self.curve_n, self.gnss_passes, self.gnss_sky = {}, {}, []
         self.info = {}          # name -> details
         self.slot_name = {}     # (plane, slot) -> name
         self.slots_heard = set()
@@ -754,10 +834,22 @@ class Data:
                 for sat, (t, fields) in c.get('ephemerides', {}).items():
                     if t >= self.gnss_eph.get(sat, (0, ''))[0]:
                         self.gnss_eph[sat] = (t, fields)
+                # every ephemeris kept (catalog 'eph_archive' since 2026-11-07; older entries hold only the newest)
+                arch = c.get('eph_archive') or {sat: [v] for sat, v in c.get('ephemerides', {}).items()}
+                for sat, kept in arch.items():
+                    for t, fields in kept:
+                        self._archive_eph(sat, t, fields)
+                for sat, (t, fields) in c.get('almanacs', {}).items():
+                    self._keep_alm(sat, t, fields)
+                for key, (t, fields) in c.get('nav_params', {}).items():
+                    self._nav_param(key, t, fields)
                 self.gnss_fixes += c.get('gnss_fixes', [])
                 self.gnss_spp += c.get('gnss_spp', [])
                 if c.get('session') and c.get('system') == 'gnss1':
                     self.gnss_sessions.append(c['session'])
+                if c.get('session') and ('skymap' in c['session'] or 'lock' in c['session']):
+                    st0 = ts(c['start_utc'])
+                    self.gnss_sky.append((st0, st0 + c['hours'] * 3600, c['session'], cap_name))
             if systems.get(c.get('system')).get('system') == 'ham':
                 if self._ham_names is None:
                     self._ham_names = catalog.norad_names()
@@ -795,6 +887,10 @@ class Data:
                     i['callsigns'] = sorted(set(i.get('callsigns', [])) | set(ps.get('callsigns', [])))
                     i['frames'] = i.get('frames', 0) + ps['frames']
                 self.doppler.setdefault(ps['name'], []).append(ps['doppler'])
+                if ps.get('doppler_n'):         # (GNSS passes catalogued since 2026-11-07: a point every 10 s)
+                    self.curve_n[id(ps['doppler'])] = (ps['doppler'], ps['doppler_n'])
+                if 'sat' in ps:
+                    self.gnss_passes.setdefault(ps['name'], []).append(ps)
             for s in c['slots']:
                 self.slots_heard.add((s['plane'], s['slot']))
                 if s['name'] and s['confidence'] == 'confident':
@@ -810,6 +906,7 @@ class Data:
         done = {c['name'] for c in self.captures}
         self.live_fixes = [f for f in self.live_fixes if f['cap'] not in done]
         self.live_doppler = {k: g for k, g in self.live_doppler.items() if k[0] not in done}
+        self.live_cn0 = {k: g for k, g in self.live_cn0.items() if k[0] not in done}
         for fx in self.live_fixes:
             self._add_live_fix_info(fx)
         for (_, n), g in self.live_doppler.items():
@@ -1127,8 +1224,9 @@ class Data:
                         g = self.gnss_glimpsed.get(sat)
                         if g is None or t - g['last'] > 2.5:         # (gnss_rx drops an epoch now and then)
                             g = self.gnss_glimpsed[sat] = {'first': t, 'run': 0}
-                        g.update(last=t, cn0=cn0, dop=dop, run=g['run'] + 1 if cn0 >= GNSS_TRACK_CN0 else 0)
-                        if g['run'] < GNSS_TRACK_S and (cap, sat) not in self._gnss_eph_live:
+                        need_s, need_cn0 = gnss_track_gate(sat)
+                        g.update(last=t, cn0=cn0, dop=dop, run=g['run'] + 1 if cn0 >= need_cn0 else 0)
+                        if g['run'] < need_s and (cap, sat) not in self._gnss_eph_live:
                             continue
                         events.append(self._gnss_track(sat, t, cn0, dop))
                     name = catalog.gnss_name(sat)
@@ -1144,6 +1242,7 @@ class Data:
                         self.live_doppler[(cap, name)] = []
                         self.doppler.setdefault(name, []).append(self.live_doppler[(cap, name)])
                     self.live_doppler[(cap, name)].append((t, catalog.GNSS_L1 + dop))
+                    self.live_cn0.setdefault((cap, name), []).append((t, cn0))
                     # its latest live signal (the details panel shows it while it is being tracked)
                     now = {'t': t, 'cn0': cn0, 'dop': dop, 'lock': float(f[4]) if len(f) > 4 else 0.0}
                     if len(f) > 8:
@@ -1154,6 +1253,7 @@ class Data:
                         tr.update(last=t, cn0=cn0, best=max(tr['best'], cn0))
                 elif kind == 'GEPH' and len(f) >= 2:
                     self.gnss_eph[f[0]] = (t, ' '.join(f[1:]))
+                    self._archive_eph(f[0], t, ' '.join(f[1:]))
                     refit.add(catalog.gnss_name(f[0]))
                     events.append('%s  ORBIT  %s broadcast its ephemeris' % (fmt_clock(t), catalog.gnss_name(f[0])))
                     if newest:
@@ -1161,8 +1261,15 @@ class Data:
                         g = self.gnss_glimpsed.get(f[0])
                         if f[0] not in self.gnss_tracking and g and t - g['last'] <= GNSS_LOST_S:
                             events.append(self._gnss_track(f[0], t, g['cn0'], g['dop']))
+                elif kind == 'GALM' and len(f) >= 2:
+                    # a satellite's almanac (rough orbit) or the UTC / GGTO parameters: no event line - a whole set is
+                    # 32 GPS satellites every 12.5 min and Galileo sends a new one every ~10 min
+                    if f[0] in ('UTCG', 'UTCE', 'GGTO'):
+                        self._nav_param(f[0], t, ' '.join(f[1:]))
+                    else:
+                        self._keep_alm(f[0], t, ' '.join(f[1:]))
                 elif kind == 'GPOS' and len(f) >= 4:
-                    fx = {'t': t, 'lat': float(f[0]), 'lon': float(f[1]), 'height_m': float(f[2]), 'nsat': int(f[3])}
+                    fx = gnss_lines.gpos_fix(t, f)
                     self.gnss_fixes.append(fx)
                     if newest:
                         st['gpos'] = t
@@ -1170,15 +1277,10 @@ class Data:
                             st['gpos_fixing'], st['gpos_since'] = True, t
                             events.append('%s  FIX  pocket_trk: %d satellites' % (fmt_clock(t), fx['nsat']))
                 elif kind == 'GSPP' and len(f) >= 5:      # our own WAAS-corrected fix (no event line: one a second)
-                    fx = {'t': t, 'lat': float(f[0]), 'lon': float(f[1]), 'height_m': float(f[2]),
-                          'nsat': int(f[3]), 'hdop': float(f[4])}
-                    if len(f) >= 9 and int(f[8]) < 4:
-                        fx['quick'] = True      # before smoothing settled: shown as the first fix, not in the accuracy
-                    if len(f) >= 10 and f[9] == '1':
-                        fx['prior'] = True      # the static antenna's height held it (its height is not measured)
+                    fx = gnss_lines.gspp_fix(t, f)      # (quick: before smoothing settled; prior: the static
+                    waas = fx.pop('waas', False)        # antenna's height held it - see gnss_lines)
                     self.gnss_spp.append(fx)
                     if newest:
-                        waas = len(f) >= 7 and (int(f[5]) > 0 or int(f[6]) > 0)
                         st['gspp'] = t
                         st['own'] = {'nsat': fx['nsat'], 'hdop': fx['hdop'], 'quick': fx.get('quick', False), 'waas': waas}
                         how = '%d satellites, HDOP %.1f%s' % (fx['nsat'], fx['hdop'], ', WAAS-corrected' if waas else '')
@@ -1190,6 +1292,17 @@ class Data:
                         elif st.get('gspp_quick') and not fx.get('quick'):
                             st['gspp_quick'] = False
                             events.append('%s  FIX  own solver settled: %s' % (fmt_clock(t), how))
+                elif kind == 'GHEARD' and len(f) >= 3:   # gnss_rx's own search (acqdetect.py) heard a satellite that
+                    # pocket_trk is not tracking: shown as 'heard, not tracked' - never as a position or an orbit
+                    sat, cn0, dop = f[0], float(f[1]), float(f[2])
+                    if newest:
+                        h = self.gnss_heard.get(sat)
+                        fresh = h is None or t - h['t'] > self.HEARD_EVENT_S
+                        if fresh and sat not in self.gnss_tracking:
+                            events.append('%s  HEARD  %s  ~%.0f dB-Hz by our own search - not tracked (too weak for '
+                                          'pocket_trk to lock, or it lost it)' % (
+                                              fmt_clock(t), catalog.gnss_name(sat), cn0))
+                        self.gnss_heard[sat] = {'t': t, 'cn0': cn0, 'dop': dop, 'first': t if fresh else h['first']}
                 elif kind == 'GGAP' and len(f) >= 1:     # a hole in the sample stream, zero-filled by gnss_rx
                     if newest:
                         st['gap'] = t
@@ -2871,13 +2984,22 @@ class Tracker(QtWidgets.QMainWindow):
                      'orbits put them %d\u00b0+ up - if this list is long, check the antenna\'s view of the sky</span>'
                      % (theme.PAL['WARN'], ', '.join('%s %.0f\u00b0' % (s, el) for s, el in missing[:8]), MUTED,
                         MISSING_EL))
+        # a Garmin handheld beside the antenna: recorded with this capture, else the last capture that had one
+        # (garmin_usb.Beside; our receiver's GPS-minus-PC clock from the Integrity watch, for its clock cross-check)
+        import garmin_usb
+        self._beside = getattr(self, '_beside', None) or garmin_usb.Beside()
+        mon = getattr(getattr(self, 'integrity', None), 'mon', None)
+        gts = [x[1] for x in getattr(mon, 'gtimes', ()) if now - x[0] < 120]
+        gline, gtip = self._beside.text(rx, getattr(d, '_cap_files', None), float(np.median(gts)) if gts else None)
+        if gline:
+            html += '<br><span style="color:%s">%s</span>' % (MUTED, gline)
         self.pos_label.setText(html)
         tip = posquality.details(q)
         if status:
             tip += '\n\nRight now: ' + status
         if d.gnss_bad_lines:
             tip += '\n(%d damaged live lines skipped)' % d.gnss_bad_lines
-        self.pos_label.setToolTip(tip + self._startup_text())
+        self.pos_label.setToolTip(tip + self._startup_text() + ('\n\n' + gtip if gtip else ''))
 
     # ---- position: GPX, reference points, a Garmin as a drive
     def _pos_menu(self, at):
@@ -2968,9 +3090,13 @@ class Tracker(QtWidgets.QMainWindow):
 
     def _garmin_import(self):
         """every 30 s: a Garmin handheld connected as a drive? Copy its GPX files (data\\garmin\\<unit>) when they
-        changed, and take reference points from them"""
+        changed, and take reference points from them. Also: one in Garmin Spanner mode (live over USB) while a GNSS
+        capture runs is recorded beside it (receiver.garmin_check)"""
         import shutil
         import string
+        note = self.receiver.garmin_check()
+        if note:
+            self.events.insertItem(0, '%s  %s' % (fmt_clock(time.time()), note))
         for letter in string.ascii_uppercase[3:]:
             dev = '%s:\\Garmin\\GarminDevice.xml' % letter
             try:
@@ -3107,18 +3233,39 @@ class Tracker(QtWidgets.QMainWindow):
             return [], 0
         import integrity
         tracked = {i.get('sat') for i in self.data.info.values() if i.get('now') and now - i['now']['t'] < 10}
-        out = []
+        # where each satellite is: its own ephemeris (any age) when we have one, else its almanac - every satellite
+        # sends the whole constellation's, so satellites never heard here can be named too (before 2026-11-07 the
+        # list could only name those with an ephemeris: 2 of 4 missing in one test). An almanac is good to a few km
+        # (plenty for 'is it up'); one is used instead of a stale ephemeris that has drifted further than that.
+        where = {}
         for name, o in self.data.orbits.items():
-            i = self.data.info.get(name, {})
-            sat = i.get('sat')
-            if not sat or sat[0] not in 'GE' or sat in tracked:
+            sat = self.data.info.get(name, {}).get('sat')
+            if sat and sat[0] in 'GE':
+                where[sat] = (o, False)
+        for sat in list(self.data.gnss_alm):
+            if sat[0] not in 'GE':
+                continue
+            a = self.data.almanac_orbit(sat, now)
+            if a is None or a.info.get('health'):       # (marked unhealthy / not in service: not expected)
+                continue
+            got = where.get(sat)
+            try:
+                stale = got and float(np.asarray(got[0].sigma_km(now)).reshape(-1)[0]) > \
+                    float(np.asarray(a.sigma_km(now)).reshape(-1)[0])
+            except Exception:
+                stale = True
+            if got is None or stale:
+                where[sat] = (a, True)
+        out = []
+        for sat, (o, alm) in where.items():
+            if sat in tracked:
                 continue
             try:
                 el = integrity.enu(home, o.ecef(now))[0]
             except Exception:
                 continue
             if el >= MISSING_EL:
-                out.append((sat, el))
+                out.append((sat + (' (almanac)' if alm else ''), el))
         return sorted(out, key=lambda x: -x[1]), len(tracked)
 
     def _startup_text(self):

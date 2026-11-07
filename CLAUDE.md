@@ -324,8 +324,9 @@ Tracker window (iridium_tracker.py: Data, MapView, Timeline, Tracker; all on the
 `.previous.json` (read only if `catalog\index.json` is missing - editing them does nothing) and
 `catalog-data.truncated-20261105.json`, `catalog.txt`, `captures\`, `tiles\`, `*-names.tle(.groups)`, `sdr.conf`,
 `gnss-solver.json`, `noise-<key>.npz`, `integrity\` (+ `iq-trigger.txt`), `integrity-events.jsonl`,
-`references.json`, `geoid.json`, `garmin\`, `images\`, `new-satellite.wav`, `tracker-error.log`, optional
-`pocket_trk.opt`.
+`references.json`, `geoid.json`, `garmin\`, `images\`, `new-satellite.wav`, `tracker-error.log`,
+`pocket_trk.opt` (written on first GNSS start if missing), `pocketsdr\<band>\` (pocket_trk's working folder),
+`gnss-height-reset.txt` (a pending height-prior reset), `rinex\` (trk2rinex output).
 
 ## Known issues / stale text (fix when touching nearby)
 - The tracker's storage protection (`_housekeeping`, `show_settings` in iridium_tracker.py) hard-codes the Iridium
@@ -341,6 +342,9 @@ Tracker window (iridium_tracker.py: Data, MapView, Timeline, Tracker; all on the
   `IridiumTracker.zip` (make_package writes `SatelliteTracker.zip`).
 
 ## History (main milestones, newest first)
+- after-batch (2026-11-07): almanac/UTC (nav_bits, GALM), ephemeris archive, catalog C/N0 + sky Signal map +
+  scintillation, heard-not-tracked search (acqdetect, GHEARD), Garmin side-by-side, MSM7 -> RINEX, bench + replay
+  scripts, graceful GNSS stop, height-prior reset - see "Status 2026-11-07" under Work remaining
 - week1-gnss (2026-11-06, after the GNSS review in `build\_tmp\review-20261106\GNSS-review.md`): sample-gap
   zero-fill + GGAP, pocket_trk watchdog restart + GLOG, `pocket_trk.opt` shipped (lost_th 10, b_dll 0.5),
   pocket_trk files beside the capture, fix-status line and state-change events in the position panel, tracked gate,
@@ -365,6 +369,68 @@ in plain words, test offline first, then a live run with them, report measured n
 hit the account's usage limit twice during the review - keep to about 10 agents per 5-hour window and let agents
 write results to `build\_tmp\` so a cut-off loses nothing.
 
+**Status 2026-11-07, the "After" batch (items 5-code, 6-11 and the small things; offline-tested, NOT yet live):**
+four helpers + the lead; scratch tests and outputs in `build\_tmp\later\{orbits,sky,garmin,rinex,mine}\`.
+- New line kinds **GALM** (almanac / UTC / GGTO facts) and **GHEARD** (`t sat cn0 dop el ratio`: a GPS satellite up
+  but not locked, found by our own search) - registered in receiver's filter, `systems` keep_kinds, catalog, tracker,
+  console. Neither is ever drawn as a position or an orbit.
+- **Item 6 DONE** (`app/nav_bits.py`): GPS almanac/health/UTC, Galileo words 5-10 + GGTO, SBAS MT17 from `$NAV`;
+  `gnss-solver.json` keeps 'alm' (28 days), 'utc', 'ggto'. Almanac vs ephemeris: GPS 1-2 km within 3 days, ~8 km at
+  6 days; Galileo 1.5 km fresh. Used by 'Up but not heard' (labelled "(almanac)"), `visible_prns` (full sets drop
+  PRNs not in the constellation) and satinfo's next pass. Leap seconds from the decoded UTC (`gnss.leap_seconds`,
+  table fallback); `rtcm3._full_week`/`_near` resolve the week nearest now (old code was a week or ~20 years off in
+  5 of 6 synthetic boundary cases); `fit` 0 -> 4 h; URA/SISA metres in `info['accuracy_m']`; Galileo E1B health
+  split from E5b. Not done: WAAS MT9 URA, the sky view's expected ring, almanacs into pocket_trk's navdata file;
+  pocket_trk's own navdata file gets almanac af0 wrong (reads the 3 LSBs as MSBs).
+- **Item 7 DONE**: catalog `eph_archive` per capture (dedupe IODE+toe), `gnss.MultiEphemerisOrbit` /
+  `MultiSBASOrbit` / `MultiGlonassOrbit` pick the nearest toe per sample (subclasses: isinstance checks still
+  hold). A day back the newest ephemeris was GPS 0.5 km / WAAS 8-16 km / GLONASS 33-50 Mm off; the archive is exact.
+- **Item 8 DONE** (`garmin_usb.py` comparison + `Beside`; receiver `garmin_check()` every 30 s starts
+  `garmin_usb.py log <stem>.garmin --parent-pid` while a GNSS band runs and a Spanner-mode unit is present; catalog
+  `cap['garmin']`; one position-panel line). Truth only with 3D+WAAS and EPH <= 5 m; horizontal only; Garmin SNR
+  never compared. Matches the review's compare.py on the 015121 pair (G23 held by the Garmin, never by us).
+- **Item 9 DONE**: passes keep C/N0 1 Hz (`'cn0': {'t0','v'}` half-dB ints, -k = k missing s) and Doppler every 10 s
+  with `doppler_n` weights (26.4 -> 10.0 MB on 50 sessions); session `skymap` (5 deg cells, own orbits only) and
+  `lock` (GPS, elevation x sector); per-pass `scint` (S4-like from 1 Hz C/N0; noise floor 0.05-0.12 by C/N0). Sky
+  window Signal button + summary (weakest direction: W, 33 vs 38 dB-Hz; GPS above 20 deg to the W locked 0-21 %);
+  satinfo Signal tab. `app/acqdetect.py --serve` (idle priority, ~0.02 core) searches 1 s a minute for untracked
+  GPS above 5 deg: 113/113 tracked found, 0/453 below-horizon false finds (threshold ratio 3.0 ~ 24 dB-Hz); it
+  takes samples in gr-osmosdr's IQ convention (NOT Q-negated). `--no-heard` turns it off. **The real catalog needs one
+  `catalog.py --redo`** (the owner's; skips captures whose .live changed in the last 20 s).
+  Finding to raise with the owner: in Integrity 'lock' events the satellites pocket_trk had just dropped were still
+  there at 35-39 dB-Hz - those alerts are pocket_trk losing lock, not the signal going.
+- **Item 10 DONE** (`app/rtcm_msm.py`, `app/rinex.py`, `tools/trk2rinex.py` -> `data\rinex\<capture>\`;
+  README "PRECISE ANTENNA POSITION"). MSM7 equals `$OBS` to <1 mm / 1 mcycle. **The item's caveats were partly
+  wrong:** pocket_trk does not steer the code (code-carrier grows a steady +16.7 m/s = the tuner ~88 Hz off); the
+  -1180 m steps and lock-time resets are the MSM encoder re-anchoring phase to code by whole cycles (repaired);
+  'PVT EPOCH ADJUSTED' shifts only the code by 20/40/60 ms of light (carrier and Doppler are moved onto the code
+  clock, LLI set); Doppler is too noisy for slips (0.6 cycle rms) - slips from the third difference of phase with
+  the common part removed; Galileo MSM7 carries 2-4 satellites now (`--galileo`, off by default). RTKLIB / CSRS-PPP
+  not run (not installed; an upload is the owner's call).
+- **Item 11**: DONE `build\tools\gnss_bench.py` (pocket_trk N times at -tscale 1 on a .cs8, --perturb cut/zero/spur,
+  --opt; on the 40 s file pocket_trk's defaults dropped 43 % of new locks within 2.5 s in one run, 0 in another) and
+  `build\tests\spp_replay.py` (all captures with .trkN files, --git REV, --prior other; HEAD == now on 4 sessions,
+  R95 3.7-4.7 m). The iq-trigger takes 'STEM SECONDS' (<= 900 s) for a long regression recording - still to record
+  (5 min outdoors with a full navigation sync). `app/gnss_lines.py` holds the GSPP/GPOS formats (gnss_rx writes,
+  catalog + tracker read through it); NOT done: moving console/Integrity/GCH readers onto it, the shared bit/CRC
+  helpers (gnss.py, spp.py, gnss_rx.py, rtcm3.py, nav_bits.py, rtcm_msm.py), splitting integrity's Monitor.
+- **Item 5 code side DONE, A/B not run**: Stop on a GNSS band writes `<stem>.stop`; gnss_rx closes the pipe, waits
+  up to 3 s for pocket_trk to exit (so it saves `.pocket_navdata.csv`), the receiver kills the tree after 4 s.
+  pocket_trk runs in `data\pocketsdr\<band>\` (`--pocket-dir`; first time seeded from app\pocketsdr). WAAS PRN
+  138 dropped from SIGNALS. `settings.json['sdr']['gnss1_rate']` (0 = 2.048 MS/s; 2400000 for the A/B, no UI;
+  the noise baseline relearns because its key holds the rate). Galileo PRNs left as they are (no reliable list of
+  non-transmitting ones here). `fast_acq` / `el_mask` untouched.
+- Small things DONE: Galileo tracked gate 10 s at 30 dB-Hz (`GNSS_TRACK_BY_SYSTEM`); Integrity says "blocked, or a
+  stream gap - checking" for the first GAP_REACQ_S + 5 s of an all-satellite drop; Settings > Location "Forget the
+  learned height" (writes `data\gnss-height-reset.txt`; gnss_rx's HeightPrior acts within a second or at start, and
+  only sessions after the reset may re-seed it from the catalog); a fresh install gets `data\pocket_trk.opt` with the
+  two measured values (receiver.POCKET_TRK_OPT, never over an existing file).
+- **Live checks to do with the owner** (one GNSS L1 hour outdoors): GALM lines and 'alm'/'utc' in gnss-solver.json;
+  GHEARD lines and the dashed rings; Stop takes ~1-4 s and `data\pocketsdr\gnss1\.pocket_navdata.csv` updates;
+  the Garmin line with the unit in Spanner mode (GPS+GLONASS, WAAS on); then `catalog.py --redo` and the sky Signal
+  layer; trk2rinex on that capture. Item 2 stays deferred until a live log shows 'RESTART clock-lost' with fixes
+  still missing.
+
 **State after week 1 (verified live on capture gnss-20261106-203728):** `data\pocket_trk.opt` (`lost_th = 10`,
 `b_dll = 0.5`) is loaded and logged, warm start restored 10 orbits, first own fix 48 s, 10 satellites incl. two
 Galileo locked. **Still to verify live:** Galileo lock durations over an hour (were 98 % under 20 s), a real stream
@@ -372,7 +438,7 @@ gap (look for `GGAP` lines / `STREAM GAP` events and whether locks survive), the
 Integrity classifying a gap as "stream gap (SDR/USB) - not RF". The offline end-to-end run script
 `build\_tmp\week1\rx\test_e2e.py` (gnss_rx on the 40 s recording through the file device, no SDR) could not be
 launched by the sandboxed assistant; the owner can run it. `data\pocket_trk.opt` lives in `data\` (not in git): a
-fresh install has none - consider having gnss_rx write the two measured defaults when the file is missing.
+fresh install has none - since 2026-11-07 the receiver writes the two measured defaults when it is missing.
 
 **Week 2 - availability and accuracy** (status 2026-11-07: item 1 DONE - static mode as described under "Own solver",
 with these changes from the plan: the error-budget weighting was built but measured worse, so 'simple' weights stay;

@@ -55,10 +55,32 @@ class _Bits:
         return x - (1 << k) if x & (1 << (k - 1)) else x
 
 
+def _now_gpst(now):
+    """Unix time -> RTKLIB-style GPST seconds. Week numbers must be resolved in GPS time: in Unix time the GPS week
+    rolls over 18 s late (the leap seconds), so for the last 18 s before each Sunday 00:00 GPST the old code put a
+    freshly sent week-number one week back"""
+    import gnss
+    return now + gnss.leap_seconds(now)
+
+
 def _full_week(week, modulo, now):
-    """a broadcast week number counted modulo `modulo` -> the full GPS week nearest to now"""
-    cur = int((now - GPS_EPOCH) // 604800)
-    return cur - ((cur - week) % modulo)
+    """a broadcast week number counted modulo `modulo` -> the full GPS week nearest to now (Unix time)"""
+    cur = int((_now_gpst(now) - GPS_EPOCH) // 604800)
+    w = cur - ((cur - week) % modulo)
+    return w + modulo if cur - w > modulo // 2 else w
+
+
+def _near(t_gpst, now):
+    """a reference time built from a week number and seconds of week -> the same seconds of week in the week that
+    puts it nearest the reception time. The week number sent is the week of TRANSMISSION: an orbit sent on
+    Saturday evening for Sunday 01:00 carries the old week and toe = 3600 s, a week too early as read (RTKLIB's
+    adjweek does the same); a reference time is always within hours of reception"""
+    ref = _now_gpst(now)
+    while t_gpst - ref > 302400:
+        t_gpst -= 604800
+    while ref - t_gpst > 302400:
+        t_gpst += 604800
+    return t_gpst
 
 
 def _gpst(week, sow):
@@ -86,7 +108,9 @@ def decode(payload, now=None):
         OMGd, tgd = b.s(24) * 2 ** -43 * SC2RAD, b.s(8) * 2 ** -31
         svh, flag, fit = b.u(6), b.u(1), b.u(1)
         sat, sig, week = 'G%02d' % prn, 'L1CA', _full_week(week, 1024, now)
-        fit = 0.0 if fit == 0 else 6.0
+        # fit interval flag (IS-GPS-200 20.3.3.4.3.1): 0 = 4 hours, 1 = more than 4 (6 h for a normal upload) -
+        # it was stored the other way round (0 for the 4-hour flag) until 2026-11-07
+        fit = 4.0 if fit == 0 else 6.0
     elif msg in (1045, 1046):
         prn, week, iode, sva = b.u(6), b.u(12), b.u(10), b.u(8)
         idot = b.s(14) * 2 ** -43 * SC2RAD
@@ -130,28 +154,24 @@ def decode(payload, now=None):
         b.s(10)                                      # second group delay
         svh, flag, fit, code = b.u(1), 0, 0.0, 0
         # BDT week (13 bits) -> GPS week; BeiDou time runs 14 s behind GPST
-        cur_bdt = int((now - GPS_EPOCH) // 604800) - 1356
-        week = cur_bdt - ((cur_bdt - week) % 8192) + 1356
+        week = _full_week(week + 1356, 8192, now)
         sat, sig = 'C%02d' % prn, 'B1I'
-        toe_gpst, toc_gpst = _gpst(week, toes) + 14, _gpst(week, toc) + 14
+        toe_gpst = _near(_gpst(week, toes) + 14, now)
+        toc_gpst = _near(_gpst(week, toc) + 14, now)
         return sat, sig, _fields(locals())
     elif msg == 1020:
         return decode_glonass(payload, now)
     else:
         return None
-    toe_gpst = _gpst(week, toes)
-    toc_gpst = _gpst(week, toc)
-    if toc_gpst - toe_gpst > 302400:                 # toc in the neighbouring week
-        toc_gpst -= 604800
-    elif toe_gpst - toc_gpst > 302400:
-        toc_gpst += 604800
+    toe_gpst = _near(_gpst(week, toes), now)
+    toc_gpst = _near(_gpst(week, toc), now)
     return sat, sig, _fields(locals())
 
 
 def _fields(v):
     """the decoded values -> {gnss.FIELDS: value}"""
     return {'iode': v['iode'], 'iodc': v['iodc'], 'sva': v['sva'], 'svh': v['svh'], 'toe_gpst': int(v['toe_gpst']),
-            'toc_gpst': int(v['toc_gpst']), 'ttr_gpst': int(v['now'] + 18), 'A': v['sqrtA'] ** 2, 'e': v['e'],
+            'toc_gpst': int(v['toc_gpst']), 'ttr_gpst': int(_now_gpst(v['now'])), 'A': v['sqrtA'] ** 2, 'e': v['e'],
             'i0': v['i0'], 'OMG0': v['OMG0'], 'omg': v['omg'], 'M0': v['M0'], 'deln': v['deln'], 'OMGd': v['OMGd'],
             'idot': v['idot'], 'crc': v['crc'], 'crs': v['crs'], 'cuc': v['cuc'], 'cus': v['cus'], 'cic': v['cic'],
             'cis': v['cis'], 'toes': v['toes'], 'fit': v['fit'], 'af0': v['af0'], 'af1': v['af1'], 'af2': v['af2'],

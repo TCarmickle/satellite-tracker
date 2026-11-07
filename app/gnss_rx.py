@@ -53,6 +53,10 @@ Lines (from its log):
                                            sat, EPOCH dt_s (its clock stepped), SYNC COARSE|FINE, START run,
                                            RESTART reason (this receiver restarted it: clock-lost after a gap that
                                            got past the zero filling, no-fix, reader-died)
+  GALM: t sat fields                       from the navigation messages' slow part (nav_bits.py), once per new one:
+                                           a satellite's almanac 'GPS|GAL,toa_gpst,svh,A,e,i0,OMG0,omg,M0,OMGd,af0,
+                                           af1' (WAAS message type 17: 'SBAS,t0,svh,x,y,z,vx,vy,vz'); sat UTCG / UTCE
+                                           GPS / Galileo UTC parameters (the leap seconds), GGTO Galileo - GPS time
 With --snap-trigger, the last 20 s of raw samples are kept in memory and saved, with the next 20 s, when the
 tracker asks (IQRecorder: an Integrity event began).
 """
@@ -76,7 +80,10 @@ import numpy as np
 import osmosdr
 from gnuradio import gr
 
+import acqdetect
 import gnss
+import nav_bits
+import gnss_lines
 import rtcm3
 import sdr_taps
 import spp
@@ -90,13 +97,16 @@ CHUNK_S = 180.0
 # GPS and Galileo. BeiDou's B1C signal is at the same frequency, but pocket_trk decodes no BeiDou orbit from it,
 # and searching its 45 codes took over a third of the processing time - so it is left out.
 # WAAS: the SBAS satellites serving North America send a GPS-like signal on the same frequency (PRN 131, 133,
-# 135; 138 was in service until 2022) - tracked alongside, and their own position decoded from their messages
-WAAS_PRNS = '131,133,135,138'
+# 135) - tracked alongside, and their own position decoded from their messages. 138 left service in 2022 and was
+# never heard here; pocket_trk searches one channel at a time, so every dead code delays the live ones
+WAAS_PRNS = '131,133,135'
 SIGNALS = ['-sig', 'L1CA', '-prn', '1-32,' + WAAS_PRNS, '-sig', 'E1B', '-prn', '1-36']
 NOISE = None                    # the band's noise meter (main)
 POCKET_OPTS = []                # extra pocket_trk arguments (main: -opt FILE)
 SNAP = None                     # the raw-sample recorder for Integrity events (main)
-GPS_UTC_S = 18                  # GPS time runs this far ahead of UTC (leap seconds)
+HEARD = None                    # the search for satellites pocket_trk is not tracking (main: HeardSearch)
+GPS_UTC_S = 18                  # (old name, for scratch scripts) - times use gnss.leap_seconds(), which follows the
+#                                 UTC parameters the satellites send (nav_bits) with its table as the fallback
 GPS_EPOCH = datetime.datetime(1980, 1, 6, tzinfo=datetime.timezone.utc)
 
 ap = argparse.ArgumentParser()
@@ -126,9 +136,12 @@ ap.add_argument('--no-spp', action='store_true')    # no GSPP lines (our own WAA
 ap.add_argument('--home', default='')               # lat,lon,alt_km: which satellites are up (warm start)
 ap.add_argument('--narrow-search', action='store_true')     # search only the satellites up (from saved orbits)
 ap.add_argument('--pocket-opts', default='')        # pocket_trk options file (-opt), e.g. its lock thresholds
+ap.add_argument('--pocket-dir', default='')         # pocket_trk's working folder (its .pocket_navdata.csv memory)
+ap.add_argument('--stop-file', default='')          # Stop: this file appears -> close the pipe so pocket_trk exits normally
 ap.add_argument('--work-stem', default='')          # pocket_trk's log and RTCM as STEM.trkN.log / .rtcm (receiver.py:
 #                                                     beside the capture, so they are kept and trimmed with it)
 ap.add_argument('--constellation', choices=('gps', 'glonass', 'beidou'), default='gps')   # gps = GPS + Galileo + WAAS
+ap.add_argument('--no-heard', action='store_true')  # no GHEARD lines (our own search for satellites not tracked)
 opts = ap.parse_args()
 if opts.constellation == 'glonass':     # every frequency channel (the SDR's slice holds the middle ones);
     # pocket_trk needs the tuning (-fo) to place each channel
@@ -148,6 +161,8 @@ def emit(line):
     with _emit_lock:        # the live tracker's reader and the sample thread both write lines
         sys.stdout.write(line + '\n')
         sys.stdout.flush()
+    if HEARD is not None and line.startswith('GCH: '):
+        HEARD.note(line)    # (which satellites are tracked, their Doppler and C/N0: what the search leaves out)
 
 
 _NUM = re.compile(r'-?\d+\.?\d*(?:[eE][-+]?\d+)?')
@@ -188,7 +203,7 @@ class Quantizer:
         self.rms = None
 
     def __call__(self, x):
-        if NOISE or SNAP:
+        if NOISE or SNAP or HEARD:
             watch_block(x)
         # 8 bits are plenty for signals under the noise: scale the noise to ~+-24 so it is neither clipped
         # nor coarse (the scale follows the noise level slowly)
@@ -244,12 +259,14 @@ class Watcher(threading.Thread):
             if skipped:
                 if SNAP:
                     SNAP.skip(skipped)
+                if HEARD:
+                    HEARD.skip()
                 if t - self.told > 60:
                     self.told = t
                     log('GNSS watch: the noise meter / raw recorder fell behind - %.1f s of samples skipped so far '
                         '(the tracking itself is not affected)' % (self.dropped / opts.rate))
             x = np.concatenate(blocks) if len(blocks) > 1 else blocks[0]
-            for watch in (NOISE, SNAP):
+            for watch in (NOISE, SNAP, HEARD):
                 if watch:
                     try:
                         watch(x, t)         # (t: when the batch's last sample arrived)
@@ -267,6 +284,163 @@ def watch_block(x):
         WATCH = Watcher(opts.rate)
         WATCH.start()
     WATCH.put(x, time.time())
+
+
+# ---------------------------------------------------------------- heard but not tracked (acqdetect.py)
+class HeardSearch:
+    """once a minute, one second of raw samples from the watches' thread goes to acqdetect.py - its own process at idle
+    priority, so neither the radio's thread nor pocket_trk's reader ever waits for it - with the GPS satellites that
+    are up by their saved broadcast orbits (STATE, --home) but have no GCH line, each with its predicted Doppler plus
+    this SDR's frequency offset (the median of measured minus predicted Doppler of the tracked satellites, ~+650 Hz
+    here). Each one it hears comes back as a GHEARD line: 'its signal reaches the antenna, pocket_trk has not locked
+    it' - never a position, never an orbit. Measured offline on four recordings (build\\_tmp\\later\\sky\\
+    acq_test.py): see acqdetect.py."""
+    EVERY_S = 60.0
+    FIRST_S = 90.0              # the first search once pocket_trk has had time to lock what it can by itself
+    TRACKED_S = 5.0             # a satellite with a GCH line this close to the snapshot counts as tracked
+    MIN_EL = 5.0                # (deg) searched from this elevation up
+    OFFSET_MAD_HZ = 50.0        # the tracked satellites must agree on the SDR offset this well for it to be used
+    MAX_STARTS = 5              # the helper process is started again at most this often in a session
+    IDLE_PRIORITY = 0x00000040  # Windows IDLE_PRIORITY_CLASS
+    NO_WINDOW = 0x08000000
+
+    def __init__(self, rate):
+        self.rate = rate
+        self.n = int(round(acqdetect.SNAP_MS * rate / 1000.0)) + int(rate * 0.002)
+        self.next_t = time.time() + self.FIRST_S
+        self.parts, self.got, self.t_first = None, 0, 0.0
+        self.busy = False
+        self.ch = {}                # sat -> (PC time, Doppler, C/N0) of its last GCH line
+        self.offset = None
+        self.proc = None
+        self.starts = 0
+        self.req = 0
+        self.stats = {'searches': 0, 'cands': 0, 'found': 0, 'cpu': 0.0, 'since': time.time()}
+        self.told = time.time()
+        self._eph = {}              # (sat, t) -> parsed ephemeris
+        self.why_not = ''
+
+    def note(self, line):
+        f = line.split()
+        if len(f) >= 6:
+            try:
+                self.ch[f[2]] = (float(f[1]), float(f[5]), float(f[4]))
+            except ValueError:
+                pass
+
+    def skip(self):
+        """the watches' queue dropped samples: the second being collected is no longer one piece"""
+        self.parts = None
+
+    def __call__(self, x, now):
+        if self.parts is None:
+            if self.busy or now < self.next_t:
+                return
+            self.parts, self.got = [], 0
+            self.t_first = now - len(x) / self.rate - usb_latency()
+        self.parts.append(x)
+        self.got += len(x)
+        if self.got < self.n:
+            return
+        snap = np.concatenate(self.parts)[:self.n]
+        self.parts = None
+        self.next_t = now + self.EVERY_S
+        self.busy = True
+        threading.Thread(target=self._run, args=(snap, self.t_first + 0.5 * self.n / self.rate), daemon=True,
+                         name='gnss-heard').start()
+
+    def _run(self, snap, t):
+        try:
+            self._search(snap, t)
+        except Exception as e:      # the search must never touch the tracking
+            log('GNSS heard-search: %r' % e)
+        finally:
+            self.busy = False
+
+    def _say(self, why):
+        if why != self.why_not:
+            self.why_not = why
+            log('GNSS heard-search: %s' % why)
+
+    def _search(self, snap, t):
+        home = [float(v) for v in opts.home.split(',')]
+        ephs = []
+        for sat, (te, text) in list(STATE.get('ephs', {}).items()):
+            if sat[:1] != 'G':
+                continue
+            if (sat, te) not in self._eph:
+                self._eph[(sat, te)] = gnss.parse_eph('$EPH,%.3f,%s,%s' % (te, sat, text))
+            e = self._eph[(sat, te)]
+            if e and not e.get('svh', 0) and abs(t - e['toe']) < 2 * 86400:
+                ephs.append(e)
+        pred = acqdetect.predict(ephs, home, t)
+        tracked = {s: v for s, v in list(self.ch.items()) if abs(t - v[0]) <= self.TRACKED_S}
+        res = np.array([v[1] - pred[s][1] for s, v in tracked.items() if s in pred])
+        if len(res) >= 2 and np.median(np.abs(res - np.median(res))) <= self.OFFSET_MAD_HZ:
+            self.offset = float(np.median(res))
+        if self.offset is None:
+            self._say('waiting for 2 tracked GPS satellites with orbits (the SDR frequency offset comes from them)')
+            return
+        cands = [(s, int(s[1:]), d + self.offset) for s, (el, d) in sorted(pred.items())
+                 if el >= self.MIN_EL and s not in tracked]
+        self.stats['searches'] += 1
+        self.stats['cands'] += len(cands)
+        if cands:
+            self._say('searching (SDR offset %+.0f Hz)' % self.offset)
+            # 8-bit I, Q as the SDR gives them (NOT negated like the pipe's: see acqdetect), the noise at ~+-24
+            k = 24.0 / (float(np.sqrt(np.mean(np.abs(snap) ** 2) / 2)) + 1e-12)
+            iq = np.empty(2 * len(snap), np.int8)
+            iq[0::2] = np.clip(np.round(snap.real * k), -127, 127)
+            iq[1::2] = np.clip(np.round(snap.imag * k), -127, 127)
+            refs = [(s, v[1], v[2]) for s, v in tracked.items()]
+            for ln in self._ask({'n': len(snap), 'rate': self.rate, 'cands': cands, 'refs': refs}, iq.tobytes()):
+                f = ln.split()
+                if f[0] == 'HIT' and len(f) >= 5 and f[1] in pred:
+                    self.stats['found'] += 1
+                    emit('GHEARD: %.3f %s %s %s %.1f %s' % (t, f[1], f[2], f[3], pred[f[1]][0], f[4]))
+                elif f[0] == 'DONE' and len(f) >= 3:
+                    self.stats['cpu'] += float(f[2])
+                elif f[0] == 'ERROR':
+                    log('GNSS heard-search: %s' % ln)
+        if time.time() - self.told > 600:
+            self.told = time.time()
+            st = self.stats
+            log('GNSS heard-search: %d searches, %d satellites searched, %d heard but not tracked; %.1f s CPU (%.3f '
+                'core)' % (st['searches'], st['cands'], st['found'], st['cpu'],
+                          st['cpu'] / max(time.time() - st['since'], 1.0)))
+
+    def _ask(self, req, data):
+        """one request to the helper process -> its answer lines (none if it can't be had)"""
+        if self.proc is None or self.proc.poll() is not None:
+            if self.starts >= self.MAX_STARTS:
+                self._say('the helper process stopped %d times - no more searches this session' % self.starts)
+                return []
+            self.starts += 1
+            self.proc = subprocess.Popen([sys.executable, os.path.join(HERE, 'acqdetect.py'), '--serve'],
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         creationflags=self.IDLE_PRIORITY | self.NO_WINDOW)
+        self.req += 1
+        req['id'] = self.req
+        try:
+            self.proc.stdin.write(json.dumps(req).encode() + b'\n')
+            self.proc.stdin.write(data)
+            self.proc.stdin.flush()
+            out = []
+            while True:
+                ln = self.proc.stdout.readline().decode(errors='replace').strip()
+                if not ln:
+                    raise OSError('the helper process ended')
+                out.append(ln)
+                if ln.startswith('DONE'):
+                    return out
+        except (OSError, ValueError) as e:
+            log('GNSS heard-search: %s' % e)
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+            self.proc = None
+            return []
 
 
 # ---------------------------------------------------------------- the band's noise (jamming watch)
@@ -391,6 +565,10 @@ class IQRecorder:
     8-bit I,Q pairs, the SDR's own ADC values (fixed scale, so a jammer's real level is kept; SDR++ / inspectrum /
     numpy open it) - with <name>.json saying the rate, frequency and time of the first sample"""
     PRE_S, POST_S = 20.0, 20.0
+    # 'STEM SECONDS' in the trigger asks for a longer stretch after it, for a regression recording that reaches a full
+    # navigation sync and a position (the 40 s files never do; a fix needs ~1-2 min). 2 bytes a sample: 4 MB/s at
+    # 2.048 MS/s, so the 15 min cap is ~3.7 GB
+    POST_MAX_S = 900.0
 
     def __init__(self, rate, center, trigger):
         self.rate, self.center, self.trigger = rate, center, trigger
@@ -455,13 +633,21 @@ class IQRecorder:
             os.remove(self.trigger)
         except OSError:
             return
+        post = self.POST_S
+        parts = stem.rsplit(None, 1)
+        if len(parts) == 2:
+            try:
+                post = min(self.POST_MAX_S, max(1.0, float(parts[1])))
+                stem = parts[0]
+            except ValueError:
+                pass            # (a stem with a space in it, no duration)
         if self.rec or not stem:        # already recording one: that one covers this too
             return
         pre = np.concatenate([self.ring[self.pos * 2:], self.ring[:self.pos * 2]])[-2 * self.filled:] \
             if self.filled else np.zeros(0, np.int8)
         t_first = now - self.filled / self.rate - usb_latency()
         q = queue.Queue()
-        self.rec = {'q': q, 'left': int(self.POST_S * self.rate)}
+        self.rec = {'q': q, 'left': int(post * self.rate)}
         threading.Thread(target=self._write, args=(stem, pre, q, t_first), daemon=True).start()
 
     def _write(self, stem, pre, q, t_first):
@@ -539,6 +725,9 @@ def started(t):
 # --spp-state (gnss-solver.json): GPS's ionosphere model and the newest broadcast orbit of each GPS / Galileo
 # satellite. Like a handheld's memory, it makes the next start warm: our solver has orbits at once, and pocket_trk
 # is told which satellites are up (visible_prns) instead of searching for all of them.
+# Also (nav_bits.py, since 2026-11-07): 'alm' {sat: [t_rx, GALM fields]} the newest almanac of every satellite
+# (kept ALM_KEEP_DAYS by its reference time), 'utc' {'UTCG' / 'UTCE': [t_rx, fields]} GPS / Galileo UTC parameters
+# (the leap seconds: gnss.set_utc) and 'ggto' [t_rx, fields] Galileo's offset to GPS time.
 STATE = {}
 QUICK_RES_M = 15.0              # quick (not yet smoothed) fixes: ranges must agree this well
 SEARCH_HOURS = 4.0              # the search list covers satellites up at any time in the next few hours
@@ -555,12 +744,39 @@ def load_state():
     if time.time() - st.get('t', 0) > EPH_KEEP_DAYS * 86400:
         st.pop('ion', None)
     st['ephs'] = {s: v for s, v in st.get('ephs', {}).items() if time.time() - v[0] < EPH_KEEP_DAYS * 86400}
+    st['alm'] = {s: v for s, v in st.get('alm', {}).items() if _alm_fresh(v[1])}
+    for key, (t, text) in sorted(st.get('utc', {}).items()):      # the leap seconds the satellites announced
+        p = nav_bits.parse_utc_text(text)
+        if p:
+            gnss.set_utc(p, t)
     return st
+
+
+def _alm_fresh(text, now=None):
+    """an almanac (GALM fields) whose reference time is within gnss.ALM_KEEP_DAYS"""
+    a = nav_bits.parse_alm(text)
+    if not a:
+        return False
+    t0 = a['t0'] if a['sys'] == 'S' else float(gnss.gpst_to_unix(a['toa_gpst']))
+    return abs((now or time.time()) - t0) < gnss.ALM_KEEP_DAYS * 86400
 
 
 def keep_eph(sat, t, text):
     STATE.setdefault('ephs', {})[sat] = [t, text]
     save_state()
+
+
+def keep_nav_fact(sat, t, text):
+    """a GALM fact into the kept state: an almanac entry, or the UTC / GGTO parameters"""
+    if sat in ('UTCG', 'UTCE'):
+        STATE.setdefault('utc', {})[sat] = [t, text]
+        save_state(force=True)      # (rare: once per session or upload)
+    elif sat == 'GGTO':
+        STATE['ggto'] = [t, text]
+        save_state()
+    else:
+        STATE.setdefault('alm', {})[sat] = [t, text]
+        save_state()
 
 
 def save_state(force=False):
@@ -580,7 +796,9 @@ def save_state(force=False):
 def visible_prns(sys_letter, n_prn, hours=SEARCH_HOURS):
     """the PRNs of one system worth searching for: those whose saved orbit (up to a week old - plenty for knowing
     whether a satellite is up) puts them above the horizon here at some time in the next `hours`, plus any we have
-    no orbit for (can't tell). None when too few orbits are known to judge, or no home location."""
+    no orbit for (can't tell). A satellite without an ephemeris is judged by its almanac (good to a few km - plenty
+    here); with a whole almanac set (GPS 24+, Galileo 18+ satellites) a PRN in neither is not in the constellation
+    and is left out. None when too few orbits are known to judge, or no home location."""
     if not opts.home:
         return None
     try:
@@ -591,21 +809,30 @@ def visible_prns(sys_letter, n_prn, hours=SEARCH_HOURS):
     rx = spp.lla_to_ecef(*lla)
     known, up = set(), set()
     now = time.time()
+    ts = np.arange(now, now + hours * 3600 + 1, 600.0)
+    orbits = {}         # prn -> the _kepler dict: its ephemeris, else its almanac
+    for sat, (t, text) in STATE.get('alm', {}).items():
+        a = nav_bits.parse_alm(text) if sat[0] == sys_letter and _alm_fresh(text, now) else None
+        if a and a['sys'] == sys_letter:
+            orbits[int(sat[1:])] = gnss.almanac_eph(a, sat)
+    n_alm = len(orbits)
     for sat, (t, text) in STATE.get('ephs', {}).items():
         if sat[0] != sys_letter:
             continue
         e = gnss.parse_eph('$EPH,%.3f,%s,%s' % (t, sat, text))
-        if not e:
-            continue
-        known.add(e['prn'])
-        ts = np.arange(now, now + hours * 3600 + 1, 600.0)
+        if e:
+            orbits[e['prn']] = e
+    for prn, e in orbits.items():
+        known.add(prn)
         pos = gnss._kepler(e, ts)[0]
         for p in pos:
             if spp.azel(rx, p, lla)[1] > math.radians(-2.0):
-                up.add(e['prn'])
+                up.add(prn)
                 break
     if len(known) < (12 if sys_letter == 'G' else 6):
         return None
+    if n_alm >= (24 if sys_letter == 'G' else 18):
+        return sorted(up)
     return sorted(up | (set(range(1, n_prn + 1)) - known))
 
 
@@ -631,7 +858,7 @@ def gpst_to_unix(ep):
     """a pocket_trk calendar epoch (GPS time: y, m, d, h, min, s) -> unix time (UTC)"""
     y, mo, d, h, mi, s = ep
     t = datetime.datetime(int(y), int(mo), int(d), int(h), int(mi), tzinfo=datetime.timezone.utc).timestamp() + s
-    return t - GPS_UTC_S
+    return float(gnss.gpst_to_unix(t))
 
 
 def track(path, t0, rate):
@@ -740,9 +967,12 @@ class HeightPrior:
         self.solver = solver
         self.free = collections.deque(maxlen=self.LEARN_N)
         self.n_new = 0
+        self.check_reset()
         st = STATE.get('height')
         if not (isinstance(st, dict) and {'h', 'lat', 'lon'} <= set(st)):
-            st = self._from_catalog()
+            # after a reset (Settings > GNSS, 'Forget the antenna height') only sessions after it may seed it again
+            after = st.get('reset', 0.0) if isinstance(st, dict) else 0.0
+            st = self._from_catalog(after)
             if st:
                 STATE['height'] = st
                 save_state(force=True)
@@ -756,11 +986,37 @@ class HeightPrior:
                 '5+ satellites)')
 
     @staticmethod
-    def _from_catalog():
-        """the median of the earlier sessions' WAAS-corrected middles (each 5+ min of settled fixes), if 2+ agree"""
+    def reset_path():
+        """the tracker asks for the height to be forgotten (the antenna was moved) by creating this file - the
+        receiver may be running and owns gnss-solver.json, so the tracker never edits that itself"""
+        return os.path.join(os.path.dirname(opts.spp_state), 'gnss-height-reset.txt') if opts.spp_state else None
+
+    def check_reset(self):
+        path = self.reset_path()
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        STATE['height'] = {'reset': time.time()}
+        self.solver.set_prior(None, 0, 0)
+        self.free.clear()
+        self.n_new = 0
+        save_state(force=True)
+        log('GNSS position solver: height prior forgotten (asked for in Settings) - learning it again from this '
+            "session's own fixes")
+        return True
+
+    @staticmethod
+    def _from_catalog(after=0.0):
+        """the median of the earlier sessions' WAAS-corrected middles (each 5+ min of settled fixes), if 2+ agree;
+        only sessions that started after `after` (a reset)"""
         import catalog
         mids = []
         for cap in catalog.load_data().values():
+            if (cap.get('session') or {}).get('start', 0.0) <= after:
+                continue
             w = (cap.get('session') or {}).get('waas') if cap.get('system') == 'gnss1' else None
             if w and w.get('r95_m', 99) < 10 and w.get('span_s', 0) >= 300:
                 mids.append((w['height_m'], w['lat'], w['lon']))
@@ -782,6 +1038,8 @@ class HeightPrior:
 
     def update(self, s):
         """one solution: learn from it and check the prior against it"""
+        if self.check_reset():
+            return
         if s.get('prior'):
             if not (s.get('ok_free') and s['nsat'] >= 5 and s.get('vdop_free', 99) <= self.VDOP_MAX):
                 return
@@ -812,7 +1070,7 @@ class HeightPrior:
             # each minute adds up to 60 fixes' weight - less with poor vertical geometry (VDOP 6: ~10)
             add = 60.0 * min(1.0, (2.5 / vd) ** 2)
             st = STATE.get('height')
-            if st and abs(sess[0] - st['h']) < self._limit(vd):
+            if st and 'h' in st and abs(sess[0] - st['h']) < self._limit(vd):
                 n0 = min(st.get('n', 0), self.MAX_N)
                 k = n0 / (n0 + add)
                 new = {'h': k * st['h'] + (1 - k) * sess[0], 'lat': k * st['lat'] + (1 - k) * sess[1],
@@ -845,6 +1103,7 @@ class Lines:
         self.last_gtime = 0.0
         self.last_epoch = {}    # satellite -> the receiver second of its last GCH line
         self.errors = {}        # exception text -> when it was last logged (a bad line must not kill the reader)
+        self.nav = nav_bits.NavDecoder()    # almanacs, UTC, GGTO from the $NAV bits -> GALM lines
         self.reset_run()
         # our own position solution (spp.py: WAAS corrections + carrier smoothing) from pocket_trk's raw measurements,
         # GPS L1 band only; GPS's ionosphere model is kept between sessions (it takes up to 12.5 min to arrive)
@@ -948,6 +1207,25 @@ class Lines:
                 if self.spp and not fields.get('glo'):
                     self.spp.eph(gnss.parse_eph('$EPH,%.3f,%s,%s' % (t, sat, text)))
 
+    def _nav_facts(self, f, when):
+        """the slow parts of the navigation messages (nav_bits): each new almanac entry, and the UTC / GGTO
+        parameters when they change, as GALM lines - kept in the solver state too. Never lets a page stop the line
+        (its WAAS message still has to reach the SBAS reader below)."""
+        try:
+            t = float(when(float(f[1])))
+            for sat, text in self.nav.line(f, t, t + gnss.leap_seconds(t)):
+                emit('GALM: %.3f %s %s' % (t, sat, text))
+                keep_nav_fact(sat, t, text)
+                if sat in ('UTCG', 'UTCE'):
+                    p = nav_bits.parse_utc_text(text)
+                    if p and gnss.set_utc(p, t):
+                        log('GNSS: leap seconds from the satellites: %s' % gnss.UTC_SOURCE[0])
+        except Exception as e:
+            key = 'almanac %s: %s' % (type(e).__name__, e)
+            if time.time() - self.errors.get(key, 0) > 60:
+                self.errors[key] = time.time()
+                log('GNSS: navigation page not understood (%s)' % key)
+
     def _spp(self, f, line):
         """pocket_trk's raw measurements and navigation messages into our own solver; a GSPP line per good fix"""
         if f[0] == '$NAV':
@@ -985,11 +1263,9 @@ class Lines:
                     self.first_fix = t
                     log('GNSS position solver: first fix %.0f s after the start (%d satellites)' % (
                         t - (_started_at[0] or t), s['nsat']))
-                # (field order is a contract with catalog.analyze_gnss and the tracker: n_smoothed, then 'prior' -
-                # 1 when the static antenna's height row held the solution, so its height is not a measurement)
-                emit('GSPP: %.3f %.9f %.9f %.3f %d %.2f %d %d %d %d %d' % (
-                    t, s['lat'], s['lon'], s['h'], s['nsat'], s['hdop'],
-                    s['iono'].get('sbas', 0), s['fast'], s['lt'], s['smoothed'], 1 if s.get('prior') else 0))
+                # (the field order is defined once, in gnss_lines - its readers are the catalog and the tracker)
+                emit(gnss_lines.gspp_line(t, s, s['iono'].get('sbas', 0), s['fast'], s['lt'], s['smoothed'],
+                                          s.get('prior')))
 
     def line(self, line, when):
         """one log line; when(receiver time) -> unix time. Nothing a line can contain may stop the reader: a dead
@@ -1011,6 +1287,8 @@ class Lines:
                 self.rt_now = max(self.rt_now, float(f[1]))
             except ValueError:
                 pass
+        if f[0] == '$NAV' and len(f) > 7:
+            self._nav_facts(f, when)
         if self.spp and f[0] in ('$NAV', '$OBS', '$EPH'):
             try:
                 self._spp(f, line)
@@ -1213,6 +1491,25 @@ def usb_latency():
     return 2 * (buflen / 2) / opts.rate + 0.005
 
 
+def pocket_dir():
+    """pocket_trk's working folder: one per band under data/pocketsdr (it reads and writes its memory file
+    .pocket_navdata.csv there - this antenna's position, almanacs, orbits). It used to be app/pocketsdr, shared by
+    every band and every test. The first time, the old file is copied over so nothing learned is lost."""
+    d = opts.pocket_dir
+    if not d:
+        return os.path.dirname(POCKET_TRK)
+    try:
+        os.makedirs(d, exist_ok=True)
+        old = os.path.join(os.path.dirname(POCKET_TRK), '.pocket_navdata.csv')
+        new = os.path.join(d, '.pocket_navdata.csv')
+        if not os.path.exists(new) and os.path.exists(old) and opts.constellation == 'gps':
+            shutil.copy2(old, new)
+        return d
+    except OSError as e:
+        log('GNSS: pocket_trk folder %s not usable (%s) - using the program folder' % (d, e))
+        return os.path.dirname(POCKET_TRK)
+
+
 class LiveTracker(threading.Thread):
     """runs pocket_trk on the pipe for the whole session (restarting it if it stops), feeds it, and reads its
     log and decoded orbits as they grow"""
@@ -1240,6 +1537,7 @@ class LiveTracker(threading.Thread):
         # best estimate (sliding, so the SDR's crystal error can't build up)
         self.received = 0
         self.t0_cands = collections.deque()
+        self.stopping = False
         self.base_min = None        # that minimum over the candidates 1-10 s old (updated once a second)
         self.base_t = 0.0
         self.pend = collections.deque(maxlen=self.GAP_BLOCKS)     # recent blocks' start-time estimates, all 'late'
@@ -1285,12 +1583,18 @@ class LiveTracker(threading.Thread):
         return min(c for _, c in list(self.t0_cands)) - usb_latency()
 
     def run(self):
-        while True:
+        while not self.stopping:
             try:
                 self.session()
             except Exception as e:
                 log('GNSS live tracker: %r' % e)
-            time.sleep(2)           # pocket_trk stopped: start it again (it picks satellites up in a minute)
+            if not self.stopping:
+                time.sleep(2)       # pocket_trk stopped: start it again (it picks satellites up in a minute)
+
+    def stop(self, timeout=4.0):
+        """Stop pressed: close the pipe and let pocket_trk end normally (see session)"""
+        self.stopping = True
+        self.join(timeout)
 
     def session(self):
         self.runs += 1
@@ -1308,7 +1612,7 @@ class LiveTracker(threading.Thread):
         renew_at = time.time() + (SEARCH_HOURS - 0.5) * 3600 if signals is not SIGNALS else None
         cmd = [POCKET_TRK] + signals + ['-fmt', 'INT8X2', '-f', '%.6f' % (self.rate / 1e6),
                                         '-log', logf, '-rtcm', rtcmf, pipe.path] + POCKET_OPTS
-        proc = subprocess.Popen(cmd, cwd=os.path.dirname(POCKET_TRK), stdout=subprocess.DEVNULL,
+        proc = subprocess.Popen(cmd, cwd=pocket_dir(), stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, creationflags=0x08000000)
         if self.runs == 1:      # (what this session ran with: option changes can then be judged capture by capture)
             log('GNSS: pocket_trk command: ' + ' '.join(cmd[1:]))
@@ -1344,6 +1648,8 @@ class LiveTracker(threading.Thread):
         started_reader = False
         why = ''
         while proc.poll() is None:
+            if self.stopping:
+                break
             if renew_at and time.time() > renew_at and live_signals() != signals:
                 log('GNSS: renewing the satellite search list')
                 break
@@ -1385,6 +1691,12 @@ class LiveTracker(threading.Thread):
                 break
             written += n
         pipe.close()
+        # end of input: pocket_trk finishes by itself and saves its memory file (.pocket_navdata.csv: almanacs, orbits,
+        # the last position - what its aided search needs); taskkill never let it, so it always started cold
+        try:
+            proc.wait(timeout=3.0 if self.stopping else 1.0)
+        except subprocess.TimeoutExpired:
+            pass
         if proc.poll() is None:
             proc.kill()
         if started_reader:
@@ -1510,7 +1822,7 @@ def main():
     if not os.path.exists(POCKET_TRK):
         log('GNSS: %s is missing - see README (PocketSDR)' % POCKET_TRK)
         sys.exit(2)
-    global NOISE, SNAP
+    global NOISE, SNAP, HEARD
     STATE.update(load_state())
     try:
         clean_temp()
@@ -1523,6 +1835,11 @@ def main():
         NOISE = NoiseMeter(opts.rate, opts.center, opts.noise_baseline)
     if opts.snap_trigger:
         SNAP = IQRecorder(opts.rate, opts.center, opts.snap_trigger)
+    if opts.mode == 'live' and opts.constellation == 'gps' and opts.home and not opts.no_heard:
+        if abs(opts.rate / 1000.0 - round(opts.rate / 1000.0)) < 1e-9:
+            HEARD = HeardSearch(opts.rate)
+        else:
+            log('GNSS heard-search: off (it needs a whole number of samples per millisecond)')
     if opts.mode == 'live':
         live = LiveTracker(opts.rate)
         live.start()
@@ -1538,11 +1855,21 @@ def main():
     log('Receiving GNSS at %.4f MHz, %.4f MS/s - %s' % (opts.center / 1e6, opts.rate / 1e6, how))
     try:
         while sdr_taps.parent_alive(opts.parent_pid):
-            time.sleep(1)
+            if opts.stop_file and os.path.exists(opts.stop_file):
+                log('GNSS: stopping (pocket_trk is given a moment to save what it knows)')
+                break
+            time.sleep(0.5)
     except KeyboardInterrupt:
         pass
+    if opts.mode == 'live':
+        live.stop()
     tb.stop()
     tb.wait()
+    if opts.stop_file:
+        try:
+            os.remove(opts.stop_file)
+        except OSError:
+            pass
 
 
 if __name__ == '__main__':

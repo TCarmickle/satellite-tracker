@@ -31,8 +31,13 @@ CONSTANTS = {'G': (3.9860050e14, 7.2921151467e-5),     # IS-GPS-200 (also QZSS)
              'E': (3.986004418e14, 7.2921151467e-5),   # Galileo OS SIS ICD
              'C': (3.986004418e14, 7.292115e-5)}       # BeiDou ICD, CGCS2000
 
-# GPST - UTC (s) from each Unix time on; no leap second has been announced after 2017
+# GPST - UTC (s) from each Unix time on; no leap second has been announced after 2017. This table is the fallback:
+# the satellites announce every leap second months ahead (GPS subframe 4 page 18, Galileo word 6 - nav_bits.py), and
+# set_utc() adds a decoded one, so a future leap second is followed without a new version of this file.
 LEAP_SECONDS = [(1341100800, 16), (1435708800, 17), (1483228800, 18)]
+_LEAPS = list(LEAP_SECONDS)         # the table + what the satellites said (replaced whole, never changed in place)
+UTC_SOURCE = ['table']              # 'table' or what set_utc was last given (for the log)
+WEEK_S = 604800
 
 FIELDS = ['iode', 'iodc', 'sva', 'svh', 'toe_gpst', 'toc_gpst', 'ttr_gpst', 'A', 'e', 'i0', 'OMG0', 'omg', 'M0',
           'deln', 'OMGd', 'idot', 'crc', 'crs', 'cuc', 'cus', 'cic', 'cis', 'toes', 'fit', 'af0', 'af1', 'af2',
@@ -47,17 +52,57 @@ SIG_GROWTH_KM = 0.005     # ...plus this times (hours past it)^2, for manoeuvres
 
 
 def gpst_minus_utc(t_unix):
+    """GPS time minus UTC (s) at Unix time(s) t: the leap seconds since 1980"""
     t = np.asarray(t_unix, float)
     out = np.full(t.shape, 15.0)
-    for start, leap in LEAP_SECONDS:
+    for start, leap in _LEAPS:
         out = np.where(t >= start, float(leap), out)
     return out
+
+
+def leap_seconds(t_unix=None):
+    """GPST - UTC (s, an int) at one Unix time (now by default) - the one place the receiver, the RTCM reader and
+    the solver take it from"""
+    import time
+    return int(gpst_minus_utc(time.time() if t_unix is None else t_unix))
+
+
+def set_utc(p, t_rx):
+    """decoded UTC parameters (nav_bits.UTC_FIELDS: dtLS, WNlsf, DN, dtLSF as sent; GPS or Galileo - both count
+    the same leap seconds) received at Unix time t_rx -> the leap-second table follows them. WNlsf is the week of
+    the leap counted modulo 256 and within 127 weeks of now (IS-GPS-200 20.3.3.5.2.4), DN its day (1 = Sunday);
+    the leap happens at the end of that day, UTC. Returns True if that changed anything. Values that make no sense
+    (a damaged page) are ignored - the table stays."""
+    global _LEAPS
+    try:
+        dtls, dtlsf, wn, dn = int(p['dtLS']), int(p['dtLSF']), int(p['WNlsf']), int(p['DN'])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not (15 <= dtls <= 60 and 15 <= dtlsf <= 60 and abs(dtlsf - dtls) <= 1 and 1 <= dn <= 7):
+        return False
+    import nav_bits
+    week = nav_bits.full_week(wn, 256, float(t_rx) + float(gpst_minus_utc(t_rx)))
+    t_leap = GPS_EPOCH + week * WEEK_S + dn * 86400            # a UTC midnight as Unix time (GPS_EPOCH is one)
+    if dtls == dtlsf:       # no leap pending: WNlsf is the last one's week, whose modulo-256 count can't be trusted
+        t_leap = min(t_leap, float(t_rx))
+    UTC_SOURCE[0] = 'decoded: GPST - UTC %d s%s' % (
+        dtls, '' if dtlsf == dtls else ', %d s from %s' % (dtlsf, time_text(t_leap)))
+    if int(gpst_minus_utc(t_leap)) == dtlsf and (dtls == dtlsf or int(gpst_minus_utc(t_leap - 1)) == dtls):
+        return False                                            # (the table already has it)
+    table = [(s, v) for s, v in _LEAPS if s < t_leap] + [(t_leap, dtlsf)]
+    _LEAPS = table
+    return True
+
+
+def time_text(t_unix):
+    import datetime
+    return datetime.datetime.fromtimestamp(t_unix, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
 
 def gpst_to_unix(t_gpst):
     """RTKLIB-style GPST seconds -> Unix (UTC) seconds"""
     t = np.asarray(t_gpst, float)
-    return t - gpst_minus_utc(t - 18.0)
+    return t - gpst_minus_utc(t - gpst_minus_utc(t))       # (the inner step: GPST read as Unix time, ~18 s off)
 
 
 def unix_to_gpst(t_unix):
@@ -66,6 +111,27 @@ def unix_to_gpst(t_unix):
 
 def is_geo(eph):
     return eph['sys'] == 'C' and eph['prn'] in BDS_GEO_PRNS
+
+
+URA_M = [2.4, 3.4, 4.85, 6.85, 9.65, 13.65, 24.0, 48.0, 96.0, 192.0, 384.0, 768.0, 1536.0, 3072.0, 6144.0]
+
+
+def accuracy_m(sys, index):
+    """the satellite's own forecast of its range accuracy (m): GPS URA index (IS-GPS-200 20.3.3.3.1.3), Galileo SISA
+    index (OS SIS ICD 5.1.12); None when it says it has none (GPS 15, Galileo 255 'no accuracy prediction') or the
+    system sends none we read (BeiDou URAI uses the GPS table)"""
+    n = int(index)
+    if sys == 'E':
+        if n <= 49:
+            return n * 0.01
+        if n <= 74:
+            return 0.5 + (n - 50) * 0.02
+        if n <= 99:
+            return 1.0 + (n - 75) * 0.04
+        if n <= 125:
+            return 2.0 + (n - 100) * 0.16
+        return None
+    return URA_M[n] if 0 <= n < len(URA_M) else None
 
 
 def parse_eph(line):
@@ -91,8 +157,16 @@ def parse_eph(line):
 
 def finish_eph(eph, sys, prn, sig=''):
     """Adds the derived keys to a dict holding the FIELDS values (as $EPH prints them)."""
+    if sys == 'E' and sig == 'E1B' and eph['svh'] & ~0x7:
+        # an I/NAV ephemeris carries the health of both its signals (rtcm3 1046: E5b status << 3 | E1-B status);
+        # we receive E1-B only, so only its own bits (health 2 bits << 1 | data validity) decide - an E5b outage
+        # must not throw away a good E1-B satellite. The E5b bits are kept beside it.
+        eph['svh_e5b'] = eph['svh'] >> 3
+        eph['svh'] &= 0x7
+    if sys in 'GJ' and not eph['fit']:
+        eph['fit'] = 4.0        # fit interval flag 0 = 4 hours (lines written before 2026-11-07 stored it as 0)
     eph.update({'sys': sys, 'prn': prn, 'sat': '%s%02d' % (sys, prn), 'sig': sig,
-                'sqrtA': math.sqrt(eph['A']), 'health': eph['svh'],
+                'sqrtA': math.sqrt(eph['A']), 'health': eph['svh'], 'accuracy_m': accuracy_m(sys, eph['sva']),
                 'toe': float(gpst_to_unix(eph['toe_gpst'])), 'toc': float(gpst_to_unix(eph['toc_gpst'])),
                 'ttr': float(gpst_to_unix(eph['ttr_gpst']))})
     t_sys = eph['toe_gpst'] - (14 if sys == 'C' else 0)          # in the satellite's own time scale
@@ -204,7 +278,9 @@ class EphemerisOrbit:
         self.info = {'fixes': 0, 'passes': 1, 'doppler_groups': 0, 'doppler_points': 0,
                      'first_obs': float(t_rx), 'last_obs': float(t_rx), 'fix_rms_km': 0.0,
                      'ephemeris': True, 'sat': eph['sat'], 'sig': eph['sig'], 'toe': eph['toe'],
-                     'health': eph['health'], 'geo': eph['geo']}
+                     'health': eph['health'], 'geo': eph['geo'],
+                     # its own accuracy forecast (URA / SISA, m) and fit interval (h; GPS only, 0 = not sent)
+                     'accuracy_m': eph.get('accuracy_m'), 'fit_h': eph.get('fit', 0.0)}
 
     def ecef(self, t):
         # position only (km): every caller (map, globe, sky view, Integrity's Doppler check by differencing two
@@ -239,6 +315,212 @@ class EphemerisOrbit:
     @property
     def period_min(self):
         return 2 * math.pi / self.p[3] / 60
+
+
+# ---------------------------------------------------------------- almanacs (nav_bits.py): rough orbits of every satellite
+# Every GPS / Galileo satellite sends the almanac of the whole constellation: a Kepler orbit without the small
+# corrections, good to a few km for days. It is used only to know where a satellite is roughly - which ones are up
+# but not heard, which to search for, the next pass - never drawn as a satellite's orbit (that is its ephemeris).
+# Measured 2026-11-07 (build\_tmp\later\orbits\alm_test.py: 6 sessions 11-03..11-07, against the same satellites'
+# own ephemerides, the largest difference over toe-2h..toe+2h): GPS almanacs within 3 days of their reference time
+# median 1.0-1.9 km, worst 4.7 km; 3-3.3 days 2.4 / 6.0 km; 5.3-6.3 days 8.2 / 12.8 km. Galileo's (a new set every
+# ~10 min, t0a minutes before it is sent) 1.5 km fresh, then fast worse: 5.3 km median / 8.5 km worst at 0.5-0.8 days.
+ALM_SIG_KM = 2.0            # 1-sigma near the reference time...
+ALM_DAYS = {'G': 3.0, 'E': 0.0}         # ...for this long either side (days)...
+ALM_RATE_KM = {'G': 2.0, 'E': 8.0}      # ...then growing this much per day (manoeuvres; nothing models drag)
+ALM_KEEP_DAYS = 28.0        # older almanacs are not used at all (gnss-solver.json drops them too)
+
+
+def almanac_eph(a, sat):
+    """an almanac entry (nav_bits.parse_alm: GPS / Galileo) -> the dict _kepler / sat_ecef read"""
+    toa = float(a['toa_gpst'])
+    return {'sys': sat[0], 'prn': int(sat[1:]), 'sat': sat, 'A': a['A'], 'e': a['e'], 'i0': a['i0'],
+            'OMG0': a['OMG0'], 'omg': a['omg'], 'M0': a['M0'], 'OMGd': a['OMGd'], 'deln': 0.0, 'idot': 0.0,
+            'crc': 0.0, 'crs': 0.0, 'cuc': 0.0, 'cus': 0.0, 'cic': 0.0, 'cis': 0.0, 'toe_gpst': toa,
+            'toes': (toa - GPS_EPOCH) % WEEK_S, 'toe': float(gpst_to_unix(toa)), 'geo': False,
+            'af0': a.get('af0', 0.0), 'af1': a.get('af1', 0.0), 'af2': 0.0, 'toc_gpst': toa, 'svh': a['svh']}
+
+
+class AlmanacOrbit:
+    """a satellite's almanac with the orbit interface (ecef, sigma_km, plane_at) - deliberately NOT an
+    EphemerisOrbit, so nothing that wants a real orbit (the map, the geometry, Integrity) mistakes it for one.
+    SBAS almanacs (message type 17: a position and velocity to 2.6 km / 10 m/s) hold their position."""
+
+    def __init__(self, text, sat, received):
+        import nav_bits
+        a = nav_bits.parse_alm(text)
+        if a is None:
+            raise ValueError('not an almanac: %r' % text[:40])
+        self.alm, self.sat = a, sat
+        self.sbas = a['sys'] == 'S'
+        if self.sbas:
+            self.t0 = a['t0']
+            self.pos = np.array([a['x'], a['y'], a['z']]) / 1000.0
+            self.eph = None
+        else:
+            self.eph = almanac_eph(a, sat)
+            self.t0 = self.eph['toe']
+        self.info = {'almanac': True, 'sat': sat, 'toa': self.t0, 'health': a['svh'], 'received': float(received)}
+
+    def ecef(self, t):
+        t = np.atleast_1d(np.asarray(t, float))
+        if self.sbas:
+            return np.repeat(self.pos[None, :], len(t), 0)
+        return _kepler(self.eph, t)[0] / 1000.0
+
+    def sigma_km(self, t):
+        days = np.abs(np.atleast_1d(np.asarray(t, float)) - self.t0) / 86400.0
+        if self.sbas:       # (2.6 km steps; a geostationary satellite's daily figure-eight is tens of km)
+            return 5.0 + 0.0 * days
+        k = self.sat[0]
+        return ALM_SIG_KM + ALM_RATE_KM.get(k, 8.0) * np.maximum(days - ALM_DAYS.get(k, 0.0), 0.0)
+
+    def usable(self, t):
+        return abs(float(t) - self.t0) < ALM_KEEP_DAYS * 86400
+
+    def plane_at(self, t):
+        if self.sbas:
+            return 0.0, 0.0
+        ri, vi = _inertial(self.eph, t)
+        node, inc, _ = _plane(ri, vi)
+        if np.ndim(t) == 0:
+            return float(node[0]), float(inc[0])
+        return node, inc
+
+    @property
+    def period_min(self):
+        if self.sbas:
+            return GEO_PERIOD_MIN
+        return 2 * math.pi / math.sqrt(CONSTANTS[self.sat[0]][0] / self.eph['A'] ** 3) / 60
+
+
+# ---------------------------------------------------------------- the ephemeris archive
+# Every ephemeris a satellite sent is kept (catalog 'eph_archive'; ~145 distinct ones over 3.4 days, ~18 kB a day),
+# and each moment uses the one whose reference time is nearest: scrubbing the timeline to yesterday draws a
+# satellite with yesterday's ephemeris, not today's extrapolated back (3 km wrong at a day, 15 km at 4 days).
+class _Archive:
+    """mixed in front of an orbit class: several decoded orbits of one satellite, each time sample served by the
+    member whose reference time t0 is nearest. Looks like the newest member (eph / t0 / p / info come from it), so
+    everything that reads those - and isinstance checks - keeps working. Members are built when first needed
+    (a GLONASS one integrates its motion: ~30 ms)."""
+
+    def _setup(self, members):
+        """members: [(t0, received, factory)] with factory() -> an orbit of the base class"""
+        best = {}
+        for t0, rx, fac in members:
+            if t0 not in best or rx > best[t0][0]:
+                best[t0] = (rx, fac)                # (two at one reference time: the later reception)
+        self._t0s = np.array(sorted(best))
+        self._fac = [best[t][1] for t in self._t0s]
+        self._built = {}
+        newest = self._member(len(self._t0s) - 1)
+        self.__dict__.update({k: v for k, v in newest.__dict__.items() if not k.startswith('_')})
+        self.info = dict(newest.info)
+        rxs = [best[t][0] for t in self._t0s]
+        self.info.update({'archive': len(self._t0s), 'archive_first_toe': float(self._t0s[0]),
+                          'archive_last_toe': float(self._t0s[-1]), 'archive_toes': [float(t) for t in self._t0s],
+                          'first_obs': float(min(rxs)), 'last_obs': float(max(rxs))})
+
+    def _member(self, k):
+        o = self._built.get(k)
+        if o is None:
+            o = self._built[k] = self._fac[k]()
+        return o
+
+    def _pick(self, t):
+        """index of the nearest-t0 member per sample"""
+        i = np.searchsorted(self._t0s, t)
+        i = np.clip(i, 1, len(self._t0s) - 1) if len(self._t0s) > 1 else np.zeros_like(i)
+        if len(self._t0s) > 1:
+            left = self._t0s[i - 1]
+            i = np.where(np.abs(t - left) <= np.abs(self._t0s[i] - t), i - 1, i)
+        return i
+
+    def _each(self, t, fn):
+        t = np.atleast_1d(np.asarray(t, float))
+        idx = self._pick(t)
+        ks = np.unique(idx)
+        if len(ks) == 1:
+            return fn(self._member(int(ks[0])), t)
+        out = None
+        for k in ks:
+            m = idx == k
+            got = np.asarray(fn(self._member(int(k)), t[m]))
+            if out is None:
+                out = np.zeros((len(t),) + got.shape[1:], got.dtype)
+            out[m] = got
+        return out
+
+    def member_at(self, t):
+        """the decoded orbit used at time t (scalar)"""
+        return self._member(int(self._pick(np.atleast_1d(float(t)))[0]))
+
+    def ecef(self, t):
+        return self._each(t, lambda o, tt: o.ecef(tt))
+
+    def sigma_km(self, t):
+        return self._each(t, lambda o, tt: np.asarray(o.sigma_km(tt), float).reshape(-1))
+
+    def plane_at(self, t):
+        if np.ndim(t) == 0:
+            return self.member_at(t).plane_at(float(t))
+        got = self._each(t, lambda o, tt: np.stack(o.plane_at(tt), -1) if len(tt) > 1 else
+                         np.array([o.plane_at(float(tt[0]))]))
+        return got[:, 0], got[:, 1]
+
+
+class MultiEphemerisOrbit(_Archive, EphemerisOrbit):
+    def __init__(self, members):
+        self._setup(members)
+
+
+def archive_key(fields):
+    """what makes a GEPH line's ephemeris a different one (catalog 'eph_archive' and the tracker dedupe by it):
+    GPS / Galileo / BeiDou (IODE, toe); GLONASS its tb; WAAS (a new message type 9 every ~2 min, a geostationary
+    satellite that hardly moves) one per hour"""
+    f = fields.replace(' ', ',').split(',')
+    if f[0] == 'SBAS':
+        return 'SBAS %d' % (float(f[1]) // 3600)
+    if f[0] == 'GLO':
+        return 'GLO %.0f' % float(f[1])
+    return '%s %s' % (f[1], f[5])          # (sig, IODE, IODC, SVA, SVH, toe_gpst, ...)
+
+
+def archive_orbit(sat, entries):
+    """a satellite's kept orbits [(received t, GEPH fields text)] -> one orbit object: the one orbit when there is
+    one, else an archive wrapper choosing the nearest reference time. Entries that don't parse are left out;
+    ValueError if none does."""
+    members, kind = [], None
+    for t, fields in entries:
+        fields = fields.replace(' ', ',')
+        try:
+            if fields.startswith('SBAS'):
+                k, t0 = 'S', float(fields.split(',')[1])
+                fac = (lambda f=fields, t=t: SBASOrbit.from_fields(f, sat, t))
+            elif fields.startswith('GLO'):
+                k = 'R'
+                t0 = glo_check_toe(float(fields.split(',')[1]), float(t))
+                if t0 is None:
+                    continue
+                fac = (lambda f=fields, t=t: GlonassOrbit.from_fields(f, sat, t))
+            else:
+                k = 'K'
+                eph = parse_eph('$EPH,%.3f,%s,%s' % (t, sat, fields))
+                if eph is None:
+                    continue
+                t0 = eph['toe']
+                fac = (lambda e=eph: EphemerisOrbit(e))
+        except (ValueError, IndexError):
+            continue
+        members.append((k, t0, float(t), fac))
+    if not members:
+        raise ValueError('no usable ephemeris')
+    kind = max(members, key=lambda m: m[2])[0]          # (one satellite sends one kind; the newest decides)
+    members = [m[1:] for m in members if m[0] == kind]
+    if len({m[0] for m in members}) == 1:
+        return max(members, key=lambda m: m[1])[2]()
+    cls = {'K': MultiEphemerisOrbit, 'S': MultiSBASOrbit, 'R': MultiGlonassOrbit}[kind]
+    return cls(members)
 
 
 # ---------------------------------------------------------------- SBAS (WAAS) geostationary satellites
@@ -488,3 +770,13 @@ class GlonassOrbit:
     @property
     def period_min(self):
         return 2 * math.pi / self.p[3] / 60
+
+
+class MultiSBASOrbit(_Archive, SBASOrbit):
+    def __init__(self, members):
+        self._setup(members)
+
+
+class MultiGlonassOrbit(_Archive, GlonassOrbit):
+    def __init__(self, members):
+        self._setup(members)

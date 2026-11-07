@@ -5,6 +5,8 @@ Each tab is one of the existing panels (location_dialog.LocationDialog, data_dia
 the window instead of on its own.
 """
 import ctypes
+import json
+import os
 import time
 
 from PyQt5 import QtCore, QtWidgets
@@ -12,6 +14,7 @@ from PyQt5.QtCore import Qt
 
 import data_dialog
 import location_dialog
+import paths
 
 
 class _LocationTab(location_dialog.LocationDialog):
@@ -65,6 +68,7 @@ class SettingsDialog(QtWidgets.QDialog):
             more.addWidget(gps)
         more.addStretch(1)
         lv.addLayout(more)
+        lv.addWidget(_HeightBox())
         lv.addStretch(1)
         self.tabs.addTab(loc_page, '\U0001F4CD  Location')
 
@@ -118,6 +122,68 @@ def set_pc_clock(offset):
     cmd = '-NoProfile -WindowStyle Hidden -Command "Set-Date -Adjust ([TimeSpan]::FromTicks(%d)) | Out-Null"' % ticks
     r = ctypes.windll.shell32.ShellExecuteW(None, 'runas', 'powershell.exe', cmd, None, 0)
     return r > 32
+
+
+class _HeightBox(QtWidgets.QGroupBox):
+    """the GNSS solver's learned antenna height (its 'height prior', gnss-solver.json) and a button to forget it
+    after the antenna was moved up or down. The receiver may be running and owns that file, so this only leaves a
+    request file (gnss_rx.HeightPrior.check_reset) that the receiver acts on within a second, or when it next starts."""
+
+    def __init__(self):
+        super().__init__('GNSS antenna height (used by the position solver)')
+        self.state_path = os.path.join(paths.DATA, 'gnss-solver.json')
+        self.reset_path = os.path.join(paths.DATA, 'gnss-height-reset.txt')
+        v = QtWidgets.QVBoxLayout(self)
+        self.text = QtWidgets.QLabel()
+        self.text.setWordWrap(True)
+        v.addWidget(self.text)
+        row = QtWidgets.QHBoxLayout()
+        self.btn = QtWidgets.QPushButton('Forget the learned height')
+        self.btn.setToolTip('Use this after moving the GPS antenna up or down (to a roof, a pole, another floor).\n'
+                            'The solver then learns the new height from 15 minutes of its own 5-satellite fixes;\n'
+                            'until then it needs 4 satellites for a position, as before the height was known.')
+        self.btn.clicked.connect(self._forget)
+        row.addWidget(self.btn)
+        row.addStretch(1)
+        v.addLayout(row)
+        self._show()
+
+    def _show(self):
+        if os.path.exists(self.reset_path):
+            self.text.setText('Will be forgotten as soon as the GNSS receiver runs (within a second if it is '
+                              'running now).')
+            self.btn.setEnabled(False)
+            return
+        try:
+            with open(self.state_path) as f:
+                h = json.load(f).get('height')
+        except (OSError, ValueError, AttributeError):
+            h = None
+        if isinstance(h, dict) and 'h' in h:
+            self.text.setText('Learned: %.1f m above the GPS ellipsoid, from %d of its own fixes (last updated %s). '
+                              'With it, 3 satellites give a position and 4 a good one.'
+                              % (h['h'], h.get('n', 0), time.strftime('%d %b %H:%M', time.localtime(h.get('t', 0)))))
+            self.btn.setEnabled(True)
+        else:
+            self.text.setText('Not learned yet (or forgotten): the solver learns it from 15 minutes of its own '
+                              '5-satellite fixes while receiving GNSS L1.')
+            self.btn.setEnabled(False)
+
+    def _forget(self):
+        if QtWidgets.QMessageBox.question(
+                self, 'Forget the antenna height',
+                'Forget the learned antenna height?\n\nDo this only if the GPS antenna was moved up or down. '
+                'Fixes need 4 satellites again until 15 minutes of new fixes have taught it the new height.') \
+                != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            with open(self.reset_path + '.tmp', 'w') as f:
+                f.write('forget the GNSS height prior (asked %s)\n' % time.strftime('%Y-%m-%d %H:%M:%S'))
+            os.replace(self.reset_path + '.tmp', self.reset_path)
+        except OSError as e:
+            self.text.setText('Could not ask for it: %s' % e)
+            return
+        self._show()
 
 
 class ClockTab(QtWidgets.QWidget):
