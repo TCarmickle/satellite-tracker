@@ -115,6 +115,13 @@ b_dll = 0.5      # code-loop bandwidth in Hz (default 0.25). At 2 samples per ch
 """
 
 
+# The SDR dropped off USB: librtlsdr says so on stderr (only ever seen with a real loss: 5 captures 2026-11-01..07, each
+# at a Windows 'surprise removed'), gnss_rx says 'SDR LOST' after 10 s without samples
+SDR_LOST = re.compile(r'rtlsdr_read_async returned|cb transfer status: 5|SDR LOST')
+REOPEN_EVERY_S = 10
+REOPEN_TRIES = 30           # about 5 minutes
+
+
 class Receiver(QtCore.QObject):
     """start() / stop() the SDR receiver. Signals:
        status(text)      one-line state for the UI
@@ -138,6 +145,8 @@ class Receiver(QtCore.QObject):
         self.garmin = None            # the Garmin recorder beside a GNSS capture (subprocess.Popen), see garmin_check
         self.stamp = None
         self.state = 'idle'           # idle / running / stopping / decoding
+        self.reopen_band = None       # the band to open again after the SDR dropped off USB (see _sdr_lost)
+        self.reopen_tries = 0
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.env = QtCore.QProcessEnvironment.systemEnvironment()
@@ -160,10 +169,14 @@ class Receiver(QtCore.QObject):
         return self.state != 'idle'
 
     # ---- start
-    def start(self, band=None):
-        """band: a systems.ORDER key to receive this time (the console's choice), instead of the tracker's saved one"""
+    def start(self, band=None, reopen=False):
+        """band: a systems.ORDER key to receive this time (the console's choice), instead of the tracker's saved one;
+        reopen: started by _reopen after the SDR dropped off USB (a start by hand ends the waiting)"""
         if self.busy:
             return
+        if not reopen:
+            self.reopen_band, self.reopen_tries = None, 0
+        self.lost_seen = False
         need = storage.settings()['min_free_gb']
         if storage.free_gb() < need:
             self.status.emit('Not starting: less than %.1f GB free on the disk holding %s' % (need, paths.DATA))
@@ -413,6 +426,9 @@ class Receiver(QtCore.QObject):
                 continue
             else:
                 self.last_status = line.strip()[:120]
+                if SDR_LOST.search(line):
+                    self.lost_seen = True
+                    QtCore.QTimer.singleShot(0, self._sdr_lost)
             keep.append(line)
         if keep:
             with open(self.log_path, 'a') as f:
@@ -481,7 +497,9 @@ class Receiver(QtCore.QObject):
                 self.fixes += kind in ('OEP', 'GPOS')
 
     # ---- stop
-    def stop(self, reason=''):
+    def stop(self, reason='', reopen=False):
+        if not reopen:
+            self.reopen_band = None       # Stop pressed: no reopening
         if self.state != 'running':
             return
         self.state = 'stopping'
@@ -502,6 +520,40 @@ class Receiver(QtCore.QObject):
         else:
             self._extractor_finished()
 
+    def _sdr_lost(self):
+        """the SDR dropped off USB (Windows: 'surprise removed', seen 13 times on 2026-11-04..07, sometimes with other
+        USB devices on the same hub): end this capture and open the SDR again by itself - before, the receiver sat
+        there with no samples until someone pressed Stop (two hours once)"""
+        if self.state != 'running' or self.reopen_band:
+            return
+        band = self.sdr.get('system')
+        if time.time() - self.t_start > 60:
+            self.reopen_tries = 0           # it had been running: a fresh round of tries
+        self.stop('the SDR dropped off USB', reopen=True)
+        self.reopen_band = band
+
+    def _maybe_reopen(self):
+        """after a capture has ended: if the SDR was lost, try it again in REOPEN_EVERY_S"""
+        if not self.reopen_band:
+            return
+        self.reopen_tries += 1
+        if self.reopen_tries > REOPEN_TRIES:
+            self.reopen_band = None
+            self.status.emit('The SDR has not come back after %d tries - check its USB cable and port (a port on the '
+                             'back of the PC, not a hub), then press Start' % REOPEN_TRIES)
+            return
+        self.status.emit('The SDR dropped off USB - opening it again in %d s (try %d of %d; Start or Stop ends the '
+                         'waiting)' % (REOPEN_EVERY_S, self.reopen_tries, REOPEN_TRIES))
+        QtCore.QTimer.singleShot(int(REOPEN_EVERY_S * 1000), self._reopen)
+
+    def _reopen(self):
+        band = self.reopen_band
+        if not band or self.busy:
+            return
+        self.start(band, reopen=True)
+        if self.state != 'running':         # could not even start (another receiver, disk full): try again later
+            self._maybe_reopen()
+
     def _kill_tree(self):
         """end the decoder and every helper process it started (their own shutdown code does not run)"""
         if self.extractor.state() != QtCore.QProcess.NotRunning:
@@ -513,6 +565,12 @@ class Receiver(QtCore.QObject):
             self.state = 'stopping'
             self._extractor_err()
             self.stop_reason = self.last_status or 'the decoder stopped by itself'
+            if getattr(self, 'lost_seen', False):      # (gnss_rx ends by itself when its samples stop)
+                self.stop_reason = 'the SDR dropped off USB'
+                if not self.reopen_band:
+                    if time.time() - self.t_start > 60:
+                        self.reopen_tries = 0
+                    self.reopen_band = self.sdr.get('system')
             if 'Failed to open' in self.stop_reason or 'usb_claim' in self.stop_reason:
                 self.stop_reason = ('the SDR (%s) could not be opened - is it plugged in, and are SDR++, SatDump '
                                     % self.sdr['device'] +
@@ -555,6 +613,7 @@ class Receiver(QtCore.QObject):
                 pass
             self.state = 'idle'
             self.running.emit(False)
+            self._maybe_reopen()
             self.status.emit('Radio stopped%s' % (': ' + self.stop_reason if self.stop_reason else ''))
             return
         got = self._received_file()
@@ -563,6 +622,7 @@ class Receiver(QtCore.QObject):
             self._remove_capture()
             self.state = 'idle'
             self.running.emit(False)
+            self._maybe_reopen()
             self.status.emit('Receiver stopped%s - nothing was received' % (': ' + self.stop_reason if self.stop_reason else ''))
             return
         self.state = 'decoding'
@@ -580,6 +640,7 @@ class Receiver(QtCore.QObject):
     def _decoder_finished(self, *_):
         self.state = 'idle'
         self.running.emit(False)
+        self._maybe_reopen()
         ok = self.decoder.exitCode() == 0
         if self.system is systems.METEOR:
             import images

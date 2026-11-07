@@ -197,7 +197,28 @@ Tracker window (iridium_tracker.py: Data, MapView, Timeline, Tracker; all on the
   accepted window for the rest of the run (it re-aligns its clock only when it has a fix). Since 2026-11-06 gnss_rx
   detects a gap from the arrival times (a steady ≥20 ms excess over 60 ms of blocks; a scheduling stall decays and is
   told apart), feeds that many zero samples (locks survive - proven on a recording), writes `GGAP: t ms source` and
-  counts gaps in the status line; a watchdog restarts pocket_trk when 'PSEUDORANGE OUT OF RANGE' arrives for GPS
+  counts gaps in the status line. **Since 2026-11-07 only after a signal check** (`LiveTracker.check_gap`): every
+  'gap' logged 11-06 evening to 11-07 (37-62 ms, up to 52 in 85 min) was blocks arriving late with nothing lost - the
+  code phase of G09/G16/G31 ran on unbroken through them in Integrity's raw recordings, the wall clock never stepped
+  (`build\_tmp\gapcheck\`: codephase.py, clockwatch.py) - and the zeros shifted pocket_trk's timeline: every lock
+  lost 5 s later, then 'clock lost' and a restart, every few minutes. Replays (gnss_bench, new `ins:T:MS`): 45.3 ms of
+  zeros into an unbroken stream lost all 4 locks; a real 100.37 ms cut unfilled lost all 4; the same cut filled with
+  exactly that many zeros kept all 4 (48.0 ms inserted survives only because it is whole code periods). The check
+  compares the code phase of up to 3 GPS satellites >= 33 dB-Hz (from the newest GCH, `CH`; the satellite sits at
+  MINUS pocket_trk's Doppler in the Q-negated stream) in 20 ms ending 25 ms before and starting 25 ms after the
+  suspected gap (a 0.5 s ring of the fed samples): unmoved (<= 2 samples) -> nothing filled, the late timing becomes
+  the baseline; moved by -n (mod 2048) on a majority -> filled with the size measured from the code (to the sample;
+  the arrival-time estimate was 44 samples off in the test); no strong satellite / disagreement -> not filled
+  (logged). ~20 ms of CPU in the sample thread, only when the detector fires. Tests: `build\_tmp\gapcheck\
+  test_gap.py` (real samples, simulated arrival times), `week1\rx\test_rx.py` (fill mechanics, check stubbed).
+  The cause of the late arrivals is not known (not the clock; GIL/scheduling suspected).
+  **The SDR dropping off USB** (Windows Kernel-PnP 1010 'surprise removed': 13 times 11-04..11-07, at 11-07 11:48 with
+  the USB headset dongle and another device on the same hub) left the receiver with no samples for hours. Now
+  gnss_rx exits with 'GNSS: SDR LOST' after `SDR_SILENT_S` 10 s without samples (exit 3, the flowgraph is not
+  waited for), and `receiver.SDR_LOST` (librtlsdr's 'rtlsdr_read_async returned' / 'cb transfer status: 5', seen only
+  at real losses, or 'SDR LOST') stops the capture and reopens the same band every `REOPEN_EVERY_S` 10 s, up to
+  `REOPEN_TRIES` 30; Start or Stop by hand ends the waiting (`build\_tmp\gapcheck\test_reopen.py`). A watchdog
+  restarts pocket_trk when 'PSEUDORANGE OUT OF RANGE' arrives for GPS
   satellites 20 times in 10 s (`GLOG: t RESTART clock-lost`), after 5 min without a fix with 5+ synced satellites, or
   when the log reader dies. pocket_trk's own events go out as `GLOG` (FOUND/LOST/FALSELOCK/EPOCH/SYNC/START/RESTART).
 - Lines emitted (exact formats in `Lines` / `NoiseMeter`):
@@ -491,7 +512,8 @@ Galileo data. Live confirmation of item 1 pending: look for 'height prior' lines
      Refresh 'Everything' 187-264 → 9-15 ms; first showing places all points once (~400 ms for 783k).
    - Integrity `StripChart`: per-pixel-column min/max, one polygon per gap-free segment, two 1 px lines instead of a
      1.5 px pen (Qt's stroker was the real cost); repaint only on new points or every 10 s (tick+paint 54 → 14 ms).
-   - gnss_rx: no sound tree for GNSS bands (the tracker greys the sound controls, `_sound_for_band`); NoiseMeter and
+   - gnss_rx: no sound tree for GNSS bands (the tracker greyed the sound controls) - **undone 2026-11-07** at the
+     owner's request (the volume slider 'no longer worked'): the sound tree is back (~0.5-0.7 core); NoiseMeter and
      IQRecorder run in a `Watcher` thread fed 50 ms batches through a bounded (~1 s) queue that drops and counts,
      never blocks work(); IQRecorder fills dropped stretches with zeros so its 20 s before / 20 s after stay timed.
      gnss_rx 0.815 → 0.312 core; work() per block 0.53 → 0.17 ms. GNOISE times are batch arrival times (≤ 50 ms

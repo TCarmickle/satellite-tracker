@@ -212,15 +212,26 @@ running at least 10-15 minutes.
     fixing with 4 GPS + 1 Galileo"), so an outage explains itself.
   - A satellite counts as tracked after 5 seconds at 25 dB-Hz or more (or as soon as its orbit
     arrives); one-second false locks no longer make rows, events or the new-satellite sound.
-  - Sample-stream gaps: the SDR's USB link loses 100-140 ms of samples a few times a day. The
-    receiver fills them with zeros so the satellites stay locked and writes "STREAM GAP 110 ms of
-    samples lost (USB) - filled" in the log; if a gap still gets past it (pocket_trk then rejects
+  - Sample-stream gaps: the SDR's USB link can lose samples (100-140 ms, a few times a day). The
+    receiver fills a real loss with exactly as many zeros so the satellites stay locked and writes
+    "STREAM GAP 110 ms of samples lost (USB) - filled" in the log. Since 7 November it first checks
+    the signal itself: samples that only arrive late, with nothing missing, are left alone (the
+    log says "samples arrived 48 ms late, but the signal runs on without a break - nothing
+    filled"). Filling those by mistake was what made every satellite drop at once every few
+    minutes on 6-7 November. If a gap still gets past it (pocket_trk then rejects
     every range as out of range and would never fix again) pocket_trk is restarted within half a
     minute ("RESTART pocket_trk lost its clock after a gap"). Before this, one such gap ended
     the positioning for the rest of a run while the satellites still looked locked. The gaps are
     counted in the capture's .log; if you see many, try another USB port (a USB 2.0 port on
     another root hub), unplug other USB storage (a Garmin in drive mode), or turn off USB
     selective suspend in the Windows power plan.
+  - The SDR dropping off USB: Windows sometimes drops the SDR from the USB bus ("surprise
+    removed" in its event log - 13 times on 4-7 November, once together with a USB headset
+    dongle on the same hub). The receiver now notices (the driver says so, or no samples arrive
+    for 10 s), ends the capture and opens the SDR again by itself every 10 s for about 5 minutes
+    ("The SDR dropped off USB - opening it again"). Before, it sat with no samples until Stop was
+    pressed. If it keeps happening, move the SDR to a USB port on the back of the PC (straight on
+    the motherboard, not a hub or the front panel) and away from other busy USB devices.
   - pocket_trk's own log and RTCM output of each run are kept beside the capture
     (<capture>.trk1.log / .trk1.rtcm: the raw ranges, carrier phases, navigation bits and events)
     and trimmed with the capture under the storage limits - the complete record of a session for
@@ -282,8 +293,8 @@ and messaging channels are shaded green, the phone channels blue.
 - Sound (in the spectrum toolbar): hear the radio like SDR++ - static, with a click or "zzt"
   for each burst. "Whole band" plays every burst the receiver hears; "Tuned" plays one channel -
   click the spectrum to choose it (the yellow marker). Nothing is decoded into speech.
-  The GNSS bands have no sound (navigation signals lie under the noise - there is nothing to
-  hear), so the sound controls are greyed out while one is received.
+  The GNSS bands have sound too, but it is only the band's hiss: navigation signals lie under
+  the noise, so you hear static (and any interference), never the satellites themselves.
   "Audio" next to the volume: an optional low-pass (softer, less hiss) and high-pass (less
   rumble) filter, and a squelch that mutes the static and opens only for bursts louder than the
   noise by the amount you set. Your choices are remembered.

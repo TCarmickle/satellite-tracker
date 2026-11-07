@@ -3428,22 +3428,6 @@ class Tracker(QtWidgets.QMainWindow):
         self.rx_dot.setText('<span style="color:%s; font-size:16px">●</span>' % (ALERT if on else IDLE))
         self.rx_btn.setEnabled(True)
         self.rx_system.setEnabled(not on)        # switch systems while stopped
-        self._sound_for_band(on)
-
-    def _sound_for_band(self, on):
-        """GNSS bands send no sound (their signals lie under the noise, there is nothing to hear - gnss_rx no longer
-        builds the sound tree for them): while one is received the sound controls are greyed out and say why"""
-        sp = getattr(self, 'spectrum', None)
-        if sp is None:
-            return
-        if not hasattr(self, '_sound_tip'):
-            self._sound_tip = sp.sound.toolTip()
-        system = getattr(self.receiver, 'system', None) or {}
-        silent = bool(on and system.get('system') == 'gnss')
-        for wdg in (sp.sound, sp.volume, sp.audio_btn):
-            wdg.setEnabled(not silent)
-        sp.sound.setToolTip('No sound on %s: satellite navigation signals lie under the noise, so there is nothing '
-                            'to hear' % system.get('label', 'this band') if silent else self._sound_tip)
 
     def _receiver_status(self, text):
         self.rx_status.setText(text)

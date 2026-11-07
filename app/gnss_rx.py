@@ -105,6 +105,7 @@ NOISE = None                    # the band's noise meter (main)
 POCKET_OPTS = []                # extra pocket_trk arguments (main: -opt FILE)
 SNAP = None                     # the raw-sample recorder for Integrity events (main)
 HEARD = None                    # the search for satellites pocket_trk is not tracking (main: HeardSearch)
+CH = {}                         # sat -> (PC time, Doppler Hz, C/N0) of its newest GCH line (LiveTracker.check_gap)
 GPS_UTC_S = 18                  # (old name, for scratch scripts) - times use gnss.leap_seconds(), which follows the
 #                                 UTC parameters the satellites send (nav_bits) with its table as the fallback
 GPS_EPOCH = datetime.datetime(1980, 1, 6, tzinfo=datetime.timezone.utc)
@@ -161,8 +162,15 @@ def emit(line):
     with _emit_lock:        # the live tracker's reader and the sample thread both write lines
         sys.stdout.write(line + '\n')
         sys.stdout.flush()
-    if HEARD is not None and line.startswith('GCH: '):
-        HEARD.note(line)    # (which satellites are tracked, their Doppler and C/N0: what the search leaves out)
+    if line.startswith('GCH: '):
+        f = line.split()
+        if len(f) >= 6:
+            try:
+                CH[f[2]] = (float(f[1]), float(f[5]), float(f[4]))
+            except ValueError:
+                pass
+        if HEARD is not None:
+            HEARD.note(line)    # (which satellites are tracked, their Doppler and C/N0: what the search leaves out)
 
 
 _NUM = re.compile(r'-?\d+\.?\d*(?:[eE][-+]?\d+)?')
@@ -1521,6 +1529,18 @@ class LiveTracker(threading.Thread):
     # gap; a burst of blocks after a scheduling stall is told apart because its excess shrinks by 2 ms per block.
     GAP_MIN_S = 0.020
     GAP_BLOCKS = 30         # 60 ms of samples with a steady excess before it counts
+    # ...but arriving late is not proof that samples were lost. On 2026-11-07 every 'gap' (37-62 ms, up to 52 in an
+    # 85-minute session) was blocks arriving late with nothing missing: the code of G09, G16 and G31 ran on without a
+    # break through them in the raw recordings Integrity kept (build/_tmp/gapcheck/codephase.py). The zeros put in
+    # for them shifted pocket_trk's timeline, it lost every satellite 5 s later and then its clock (restart, a minute
+    # without positions). So before anything is filled, the strongest GPS satellites' code phase is compared just
+    # before and just after the suspected gap (check_gap): samples really lost move it by exactly that many samples
+    # (mod one 1 ms code period), which also gives the gap's size to the sample.
+    RING_S = 0.5            # recent samples kept for that check
+    CHECK_CN0 = 33.0        # satellites at least this strong (dB-Hz) are used for it, up to CHECK_SATS of them
+    CHECK_SATS = 3
+    CHECK_RATIO = 4.0       # their correlation peak must stand this far above the median, before and after
+    SAME_SAMPLES = 2        # code phase moved by no more than this: the stream is continuous
 
     def __init__(self, rate):
         super().__init__(daemon=True)
@@ -1540,10 +1560,15 @@ class LiveTracker(threading.Thread):
         self.stopping = False
         self.base_min = None        # that minimum over the candidates 1-10 s old (updated once a second)
         self.base_t = 0.0
-        self.pend = collections.deque(maxlen=self.GAP_BLOCKS)     # recent blocks' start-time estimates, all 'late'
+        self.pend = collections.deque(maxlen=self.GAP_BLOCKS)     # recent late blocks: (start-time estimate, sample no.)
+        self.ring, self.ring_n = collections.deque(), 0           # (sample no., 8-bit IQ bytes) of the last RING_S
+        self.late = []              # (PC time, seconds, verdict) of late arrivals that turned out not to be gaps
+        self.last_feed = 0.0        # PC time of the newest block (main() notices when the SDR stops sending)
+        self._codes = {}
 
     def feed(self, data, n):
         now = time.time()
+        self.last_feed = now
         c = now - (self.received + n) / self.rate
         if now - self.base_t >= 1.0:
             old = [v for t, v in self.t0_cands if t < now - 1.0]
@@ -1551,10 +1576,23 @@ class LiveTracker(threading.Thread):
                 self.base_min = min(old)
             self.base_t = now
         if self.base_min is not None and c - self.base_min > self.GAP_MIN_S:
-            self.pend.append(c)
-            if len(self.pend) == self.GAP_BLOCKS and max(self.pend) - min(self.pend) < 0.010:
-                gap = min(self.pend) - self.base_min
-                n_gap = int(round(gap * self.rate))
+            self.pend.append((c, self.received))
+            cs = [p[0] for p in self.pend]
+            lost = False
+            if len(self.pend) == self.GAP_BLOCKS and max(cs) - min(cs) < 0.010:
+                gap = min(cs) - self.base_min
+                verdict, n_gap, why = self.check_gap(self.pend[0][1], int(round(gap * self.rate)))
+                if verdict == 'lost':
+                    lost = True
+                    log('GNSS: samples lost (%s)' % why)
+                    gap = n_gap / self.rate
+                else:                       # nothing missing (or nothing to tell by): no zeros - the late arrival
+                    self.late.append((now, gap, verdict))      # becomes the new normal, as after a fill
+                    log('GNSS: samples arrived %.0f ms late, %s - nothing filled' % (1000.0 * gap, why))
+                    self.t0_cands.clear()
+                    self.base_min = c
+                    self.pend.clear()
+            if lost:
                 # the lost samples take their place as zeros: the pipe writer puts them in before this block
                 try:
                     self.q.put_nowait((None, n_gap, self.received, 'usb'))
@@ -1571,6 +1609,10 @@ class LiveTracker(threading.Thread):
             self.pend.clear()
         k = self.received
         self.received += n
+        self.ring.append((k, data))
+        self.ring_n += n
+        while self.ring_n - len(self.ring[0][1]) // 2 > self.RING_S * self.rate:
+            self.ring_n -= len(self.ring.popleft()[1]) // 2
         self.t0_cands.append((now, c))
         while self.t0_cands[0][0] < now - 10:
             self.t0_cands.popleft()
@@ -1581,6 +1623,82 @@ class LiveTracker(threading.Thread):
 
     def t_stream0(self):
         return min(c for _, c in list(self.t0_cands)) - usb_latency()
+
+    def samples(self, k0, n):
+        """samples k0 .. k0+n of the stream (as pocket_trk gets them) from the ring, or None if not all there"""
+        parts, have = [], 0
+        for k, data in list(self.ring):
+            m = len(data) // 2
+            if k + m <= k0 or k >= k0 + n:
+                continue
+            a, b = max(k0, k) - k, min(k0 + n, k + m) - k
+            parts.append(np.frombuffer(data, np.int8)[2 * a:2 * b])
+            have += b - a
+        if have != n:
+            return None
+        iq = np.concatenate(parts).astype(np.float32)
+        return iq[0::2] + 1j * iq[1::2]
+
+    def _phase(self, x, prn, f):
+        """code phase (samples) of a GPS satellite in 20 ms of samples at frequency f (4 x 5 ms coherent), and the
+        peak's power over the median"""
+        N = int(round(self.rate / 1000.0))
+        if prn not in self._codes:
+            c = np.array(acqdetect.ca_code(prn), dtype=np.float32) * 2 - 1
+            self._codes[prn] = np.conj(np.fft.fft(c[(np.arange(N) * 1.023e6 / self.rate).astype(int) % 1023]))
+        t = np.arange(len(x)) / self.rate
+        y = (x * np.exp(-2j * np.pi * f * t)).reshape(4, 5, N).sum(1)
+        p = (np.abs(np.fft.ifft(np.fft.fft(y, axis=1) * self._codes[prn], axis=1)) ** 2).sum(0)
+        return int(np.argmax(p)), float(p.max() / (np.median(p) + 1e-12))
+
+    def check_gap(self, k_gap, n_gap):
+        """were samples really lost just before sample k_gap? -> (verdict, samples lost, why):
+        'lost' (the code jumped: the size is measured from it), 'whole' (the code runs on: nothing lost) or 'unknown'
+        (no GPS satellite strong enough to tell, or they disagree)"""
+        try:
+            N = int(round(self.rate / 1000.0))
+            if abs(self.rate / 1000.0 - N) > 1e-6:
+                return 'unknown', n_gap, 'no check possible at this sample rate'
+            now = time.time()
+            sats = sorted(((v[2], s, v[1]) for s, v in list(CH.items())
+                           if s[0] == 'G' and now - v[0] < 5.0 and v[2] >= self.CHECK_CN0
+                           and int(s[1:]) in acqdetect.G2_TAPS), reverse=True)[:self.CHECK_SATS]
+            if not sats:
+                return 'unknown', n_gap, 'no GPS satellite strong enough to check the signal'
+            # 20 ms ending 25 ms before the suspected gap and 20 ms starting 25 ms after it: 70 ms apart, a whole
+            # number of code periods, so an unbroken stream shows the same code phase in both
+            before = self.samples(k_gap - 45 * N, 20 * N)
+            after = self.samples(k_gap + 25 * N, 20 * N)
+            if before is None or after is None:
+                return 'unknown', n_gap, 'the samples around it are not at hand'
+            moves = []
+            for cn0, sat, dop in sats:
+                prn = int(sat[1:])
+                best = None
+                for df in (-40.0, 0.0, 40.0):   # (the satellite sits at minus pocket_trk's Doppler in this stream)
+                    p, r = self._phase(before, prn, -dop + df)
+                    if best is None or r > best[1]:
+                        best = (p, r, -dop + df)
+                if best[1] < self.CHECK_RATIO:
+                    continue
+                p2, r2 = self._phase(after, prn, best[2])
+                if r2 < self.CHECK_RATIO:
+                    continue
+                moves.append((sat, ((p2 - best[0] + N // 2) % N) - N // 2))
+            if not moves:
+                return 'unknown', n_gap, 'the satellites were too weak in the samples to check'
+            text = ', '.join('%s %+d' % m for m in moves)
+            moved = [d for _, d in moves if abs(d) > self.SAME_SAMPLES]
+            if not moved:
+                return 'whole', 0, 'but the signal runs on without a break (code phase %s samples)' % text
+            if len(moved) * 2 <= len(moves) or max(moved) - min(moved) > 2 * self.SAME_SAMPLES:
+                return 'unknown', n_gap, 'the satellites disagree (code phase %s samples)' % text
+            # n samples lost move the code by -n (mod one period): the size nearest the arrival-time estimate
+            x = int(round(-float(np.median(moved)))) % N
+            n_sig = x + N * int(round((n_gap - x) / float(N)))
+            return 'lost', max(n_sig, 1), 'code phase %s samples: %.1f ms' % (text, 1000.0 * max(n_sig, 1) / self.rate)
+        except Exception as e:      # the check must never stop the samples
+            return 'unknown', n_gap, 'the check failed (%r)' % e
 
     def run(self):
         while not self.stopping:
@@ -1753,9 +1871,11 @@ class LiveTracker(threading.Thread):
                 last_note = time.time()
                 locked = sorted(s for s, rt in self.out.last_ch.items() if when(rt) > time.time() - 5)
                 log('%d | GNSS live: %d satellites locked now (%s), %d broadcast orbits, %d position fixes '
-                    '(%d WAAS-corrected), %d stream gaps (%.2f s filled with zeros), %.2f s dropped from the queue%s' % (
+                    '(%d WAAS-corrected), %d stream gaps (%.2f s filled with zeros), %d late arrivals with nothing '
+                    'lost, %.2f s dropped from the queue%s' % (
                         time.time(), len(locked), ' '.join(locked) or 'none', len(self.out.eph), self.out.fixes,
-                        self.out.spp_fixes, len(self.gaps), sum(g[1] for g in self.gaps), self.dropped / self.rate,
+                        self.out.spp_fixes, len(self.gaps), sum(g[1] for g in self.gaps), len(self.late),
+                        self.dropped / self.rate,
                         ', WAAS messages %s' % self.out.sbas_types if self.out.sbas_types else ''))
             if not alive:
                 return
@@ -1785,12 +1905,12 @@ class Receiver(gr.top_block):
         self.taps = []
         if opts.spectrum_port:      # (every 8th FFT frame: the signals are under the noise, and every frame cost 0.2 core)
             self.taps.append(sdr_taps.add_spectrum(self, src, opts.spectrum_port, center, rate, every=8))
-        # no sound: GNSS signals lie under the noise, so there is nothing to hear on these bands, and the sound tree
-        # (channel filter, demodulators, resampler) cost ~0.5-0.7 core for it (cpu_breakdown.out, rx_cpu.py).
-        # --audio-port is still accepted (receiver.py passes it to every band); with no hello from here the tracker's
-        # sound controls know there is no sound to play, and the tracker greys them out for GNSS bands.
+        # sound: GNSS signals lie under the noise, so it is the band's hiss (and any interference) - but the owner
+        # wants the volume to work on every band. It costs ~0.5-0.7 core (channel filter, demodulators, resampler:
+        # build/_tmp/week2/gui cpu_breakdown.out); week 2 left it out, it came back on 2026-11-07. The blocks are
+        # GNU Radio's C++ ones, so the samples' Python thread does not wait for them.
         if opts.audio_port:
-            log('Sound: none on GNSS bands (the signals are under the noise - nothing to hear)')
+            self.taps.append(sdr_taps.add_audio(self, src, opts.audio_port, rate, channel_hz=36e3, demod='am'))
 
 
 def clean_temp():
@@ -1816,6 +1936,9 @@ def clean_temp():
             pass
     if freed:
         log('GNSS: removed %.0f MB of old working files from the temporary folder' % (freed / 2 ** 20))
+
+
+SDR_SILENT_S = 10      # no samples this long while live: the SDR is gone (receiver.SDR_LOST reopens it)
 
 
 def main():
@@ -1858,6 +1981,14 @@ def main():
             if opts.stop_file and os.path.exists(opts.stop_file):
                 log('GNSS: stopping (pocket_trk is given a moment to save what it knows)')
                 break
+            if opts.mode == 'live' and live.last_feed and time.time() - live.last_feed > SDR_SILENT_S:
+                # the SDR stopped sending (it dropped off USB): the flowgraph would wait for ever. End, so the
+                # receiver can open it again; the flowgraph is not waited for (its USB calls may hang)
+                log('GNSS: SDR LOST - no samples for %d s (it dropped off USB?)' % SDR_SILENT_S)
+                live.stop()
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(3)
             time.sleep(0.5)
     except KeyboardInterrupt:
         pass

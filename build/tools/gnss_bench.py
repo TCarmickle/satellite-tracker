@@ -10,6 +10,8 @@ it gives the rate (else --rate).
 --perturb (one or more):
     cut:T:MS     remove MS milliseconds of samples at T seconds (an RTL-SDR/USB loss left as a cut)
     zero:T:MS    replace them with zeros (what gnss_rx's gap zero-fill does with a loss)
+    ins:T:MS     insert MS milliseconds of zeros at T seconds with nothing missing (a zero-fill for a 'gap' that was
+                 only a late arrival - what gnss_rx did until 2026-11-07)
     spur:KHZ:DB  add a steady carrier KHZ kHz from the centre, DB dB above the noise (a narrowband spur/jammer)
 Runs are one at a time and real time (-tscale 1): faster replays starve pocket_trk's one-channel-at-a-time search,
 and its search timing varies between runs, so compare settings over several runs (the median row).
@@ -57,10 +59,12 @@ def prepare(src, out, rate, q_negated, perturb):
     for p in perturb:
         kind, a, b = p.split(':')
         a, b = float(a), float(b)
-        if kind in ('cut', 'zero'):
+        if kind in ('cut', 'zero', 'ins'):
             i0, n = int(a * rate) * 2, int(b / 1000.0 * rate) * 2
             if kind == 'cut':
                 m = np.concatenate([m[:i0], m[i0 + n:]])
+            elif kind == 'ins':
+                m = np.concatenate([m[:i0], np.zeros(n, np.int8), m[i0:]])
             else:
                 m[i0:i0 + n] = 0
             notes.append('%s %.0f ms at %.1f s' % (kind, b, a))
