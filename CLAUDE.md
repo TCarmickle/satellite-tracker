@@ -59,6 +59,10 @@ pictures via SatDump), **Radio** (SDR++-style listening 24 MHz-2.3 GHz), **Integ
 - Reference receiver: a **Garmin GPSMAP 64st** handheld (see "Garmin").
 
 ## Running, testing, debugging
+- Taskbar: the process AppUserModelID is `SatelliteTracker.App`; `taskbar.set_relaunch` also puts relaunch properties
+  on the main window (command `python\pythonw.exe -s app\start.py`, `app\icon.ico`), so a pinned button keeps the
+  icon and starts the tracker. `start.py` therefore recreates the .bat's environment itself (runtime dirs on PATH,
+  QT_PLUGIN_PATH, PYTHONNOUSERSITE, cwd `app\`), only filling in what is missing.
 - Launch: `Satellite Tracker.bat` (pythonw `app\start.py`), `Satellite Console.bat` (`app\console.py`, a line-by-line
   log of every band except Radio; `--receive --band <key>` receives without the window; `--capture NAME` prints a
   finished capture).

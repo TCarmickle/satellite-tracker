@@ -52,6 +52,7 @@ import orbitfit  # noqa: E402  (orbits from our own observations)
 import receiver  # noqa: E402  (the SDR receiver and decoder, run from here)
 import location_dialog  # noqa: E402
 import popout  # noqa: E402  (pop-out windows, the main view)
+import taskbar  # noqa: E402  (what a pinned taskbar button starts)
 
 UTC = datetime.timezone.utc
 HOME_LAT, HOME_LON, HOME_H = catalog.HOME or (0.0, 0.0, 0.0)   # set_home() changes it while running
@@ -4475,7 +4476,7 @@ def main():
     if sys.platform == 'win32':     # its own taskbar button and icon, not Python's
         try:
             import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('SatelliteTracker.App')
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(taskbar.APP_ID)
         except (AttributeError, OSError):
             pass
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
@@ -4486,6 +4487,8 @@ def main():
     apply_app_colours(app)
     replay = [a[18:] for a in sys.argv if a.startswith('--test-receiver=')]   # testing without the SDR
     w = Tracker(replay[0] if replay else None)
+    # what a pinned taskbar button starts (and its icon) - set before the window is first shown
+    taskbar.set_relaunch(w.winId(), os.path.dirname(os.path.abspath(__file__)))
     if '--start-receiver' in sys.argv:  # start receiving straight away (with the band chosen in Source)
         QtCore.QTimer.singleShot(2000, lambda: w.receiver.busy or w.toggle_receiver())
     if '--snapshot' in sys.argv:      # for testing: render a picture of the window and quit

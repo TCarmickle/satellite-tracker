@@ -93,6 +93,11 @@ STARTING
 5. Press "Stop receiver" when you're done. The capture is then decoded into the catalog
    automatically, and the satellites you heard get their orbits.
 
+To keep it on the taskbar: while it runs, right-click its taskbar button > Pin to taskbar. The
+pinned button has the tracker's icon and starts the tracker directly. (A button pinned with an
+older version shows Python's icon and only starts Python: unpin it, start the tracker with
+"Satellite Tracker.bat", and pin it again. If the folder moves, pin it again too.)
+
 Ring alerts with positions come in when a satellite passes over or near you; give it at
 least 30-60 minutes outdoors. In the list on the right, click a satellite to see every
 position it sent you and how good its orbit is.
