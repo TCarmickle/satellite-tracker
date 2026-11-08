@@ -63,6 +63,11 @@ pictures via SatDump), **Radio** (SDR++-style listening 24 MHz-2.3 GHz), **Integ
   on the main window (command `python\pythonw.exe -s app\start.py`, `app\icon.ico`), so a pinned button keeps the
   icon and starts the tracker. `start.py` therefore recreates the .bat's environment itself (runtime dirs on PATH,
   QT_PLUGIN_PATH, PYTHONNOUSERSITE, cwd `app\`), only filling in what is missing.
+- Startup hang report: `main()` arms `faulthandler.dump_traceback_later(STARTUP_HANG_S` 60 s`)` into
+  `data\startup-hang.txt`, cancelled and the file removed once the event loop runs. 2026-11-07, ~4 min after a Fast
+  Startup resume: three starts hung windowless, idle, no error; loaded modules stopped at Qt + winmm/wdmaud/AudioSes
+  (sound.SoundPlayer's QAudioOutput / Chime's QSoundEffect are the suspects); later starts were fine. The stuck
+  copies could not be killed from the assistant's shell - the owner ends them in Task Manager.
 - Launch: `Satellite Tracker.bat` (pythonw `app\start.py`), `Satellite Console.bat` (`app\console.py`, a line-by-line
   log of every band except Radio; `--receive --band <key>` receives without the window; `--capture NAME` prints a
   finished capture).

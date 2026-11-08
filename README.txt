@@ -480,6 +480,12 @@ TROUBLESHOOTING
                                 another program (SDR++, SatDump...) is using it. If the
                                 receiver log says "usb_open error -5", it is the driver: see
                                 "THE USB DRIVER" near the top.
+The window never appears        Seen a few minutes after Windows came back from a Fast Startup
+                                "shut down": the start hung inside Windows' audio/window setup.
+                                Each try leaves one more stuck copy. In Task Manager > Details,
+                                end every pythonw.exe from this folder, then start it once more.
+                                After 60 s without a window the tracker writes where it was stuck
+                                to data\startup-hang.txt - keep that file for a fix.
 "decoder used over 2 GB"        Too many false bursts - the threshold is too low or there is
                                 strong interference. It stops itself to protect the computer.
 Nothing decoded                 Check the antenna is outside with sky view; Iridium is at

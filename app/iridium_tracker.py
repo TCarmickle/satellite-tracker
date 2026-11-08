@@ -15,6 +15,7 @@ Map tiles come from OpenStreetMap and are cached in the tiles folder.
 import collections
 import concurrent.futures
 import datetime
+import faulthandler
 import glob
 import json
 import math
@@ -66,6 +67,10 @@ FAINT_SIGMA_KM = 150  # draw it faded beyond this uncertainty
 IRIDIUM_FLOOR_KM = 12.0     # what an Iridium orbit from ring-alert positions is off by while heard
 IRIDIUM_DRIFT_KM_H = 2.5    # ...and how fast that grows once it's no longer heard (km per hour)
 FIT_DAYS = 7          # orbits are fitted to each satellite's most recent week of observations
+# if the window hasn't appeared this long after starting, write where startup is stuck to data\startup-hang.txt.
+# 2026-11-07: three starts a few minutes after a Fast Startup resume hung with no window and no error - Qt and
+# Windows' audio (winmm, wdmaud, AudioSes) loaded, then nothing; a normal start shows the window in ~20 s
+STARTUP_HANG_S = 60
 PLANE_MAX_SIGMA_KM = 300  # a satellite's orbit plane must be known this well to place its plane
 PLANE_JOIN_DEG = 5.0      # a satellite without a slot number joins a plane whose node is this close
 PLANE_SPACING_DEG = 31.6  # Iridium's planes, numbered 1-6 in order, are this far apart (design value)
@@ -4473,6 +4478,30 @@ def main():
         sys.__stderr__ and sys.__stderr__.write(text)
     sys.excepthook = excepthook
 
+    # a start that hangs has no window and raises nothing, so the excepthook never sees it: arm a stack dump of
+    # every thread, cancelled (and its file removed) once the event loop runs, i.e. once the window is up
+    hang_path = os.path.join(paths.DATA, 'startup-hang.txt')
+    t_start = time.time()
+    try:
+        hang_file = open(hang_path, 'w')
+        hang_file.write('%s: the window had not appeared %d s after starting. Where every thread was then:\n\n'
+                        % (time.ctime(), STARTUP_HANG_S))
+        hang_file.flush()
+        faulthandler.dump_traceback_later(STARTUP_HANG_S, file=hang_file)
+    except OSError:
+        hang_file = None
+
+    def started():
+        if hang_file is None:
+            return
+        faulthandler.cancel_dump_traceback_later()
+        hang_file.close()
+        if time.time() - t_start < STARTUP_HANG_S:      # no dump written: nothing to keep
+            try:
+                os.remove(hang_path)
+            except OSError:
+                pass
+
     if sys.platform == 'win32':     # its own taskbar button and icon, not Python's
         try:
             import ctypes
@@ -4480,6 +4509,7 @@ def main():
         except (AttributeError, OSError):
             pass
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    QtCore.QTimer.singleShot(0, started)    # runs when app.exec_() starts, after the window is shown
     app.setApplicationName('Satellite Tracker')
     app.setWindowIcon(QtGui.QIcon(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icon.ico')))
     app.setStyle('Fusion')
