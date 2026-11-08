@@ -56,7 +56,7 @@ everything received is shown together, with a **Systems** filter.
 - **Stays small**: raw recordings are cleaned up automatically (7 days / 1 GB by default), long-term
   storage is ~1-2% of a capture, the map cache is capped, and receiving stops before the disk fills
 - **Self-contained**: one folder with its own Python, GNU Radio and decoder - nothing to install
-  except the SDR's USB driver
+  except the SDR's USB driver (from source: also Miniforge, once, to build that Python folder)
 
 ## What you need
 - Windows 10/11 (64-bit)
@@ -64,16 +64,57 @@ everything received is shown together, with a **Systems** filter.
 - An L-band antenna (1.6 GHz) with a view of the sky - even a short whip outdoors decodes ring alerts
 - Optional: a 137 MHz whip or V-dipole (Orbcomm), a 2 m / 70 cm whip (ISS, CubeSats), an active GPS
   antenna and an SDR with a bias-T (GPS / Galileo)
-- The WinUSB driver for the SDR, installed once with [Zadig](https://zadig.akeo.ie)
+- The WinUSB driver for the SDR, installed once with [Zadig](https://zadig.akeo.ie) - **check this first if
+  Start receiver won't start** (see [The SDR's USB driver](#the-sdrs-usb-driver))
 
 ## Getting started
-1. Build the package (see [BUILDING.md](BUILDING.md)) or get `SatelliteTracker.zip` from someone who did,
-   and unzip it somewhere you can write to (not *Program Files*).
-2. Double-click **`Satellite Tracker.bat`**.
-3. Click your antenna's location on the map (zoom in first for a precise spot).
-4. Press **Start receiver**. Give it 30-60 minutes outdoors; press **Stop receiver** when done.
+**From the ready-made zip:** unzip `SatelliteTracker.zip` somewhere you can write to (not *Program Files*).
+It already holds its own Python, so skip to step 4 below.
+
+**From this GitHub repository:** the repository holds the source only. The bundled Python runtime
+(`python\`, with GNU Radio and the decoders) is built on your PC once, with conda:
+1. **Get the code** somewhere you can write to (not *Program Files*): with
+   [Git for Windows](https://gitforwindows.org), `git clone https://github.com/TCarmickle/satellite-tracker.git`,
+   or *Code > Download ZIP* on GitHub. Git is only needed if you want to pull updates.
+2. **Install [Miniforge](https://github.com/conda-forge/miniforge)** (conda from conda-forge) once: the
+   *Miniforge3-Windows-x86_64.exe* installer, "Just Me", default folder `%USERPROFILE%\miniforge3`. It doesn't
+   need to be added to PATH.
+3. **Build the runtime** from the repository folder, in a Command Prompt:
+   ```bat
+   %USERPROFILE%\miniforge3\python.exe build\build_runtime.py
+   ```
+   This downloads about 1 GB of pinned packages and leaves a `python\` folder of about 550-650 MB; it takes
+   several minutes. Use Miniforge's Python as shown: a plain `python` on Windows is often only the Microsoft
+   Store shortcut. Details and options are in [BUILDING.md](BUILDING.md).
+4. **Install the SDR's USB driver** with Zadig - see [The SDR's USB driver](#the-sdrs-usb-driver) below.
+5. Double-click **`Satellite Tracker.bat`**.
+6. Click your antenna's location on the map (zoom in first for a precise spot).
+7. Press **Start receiver**. Give it 30-60 minutes outdoors; press **Stop receiver** when done.
 
 The full user guide is [README.txt](README.txt).
+
+## The SDR's USB driver
+Windows doesn't come with a driver the tracker can use for an RTL-SDR, and it can't be bundled. Without it the
+window opens normally but **Start receiver stops at once**: the status says *the SDR could not be opened*, and the
+receiver log (`data\captures\output-*.log`) shows `usb_open error -5` and `Failed to open rtlsdr device`.
+
+To install it (needs administrator rights):
+1. Plug in the SDR - a USB 2.0 port straight on the PC is best (USB 3.0 ports radiate noise near L-band, and
+   hubs shared with other devices have dropped the SDR).
+2. Run [Zadig](https://zadig.akeo.ie), then *Options > List All Devices*.
+3. Pick **Bulk-In, Interface (Interface 0)** - USB ID `0BDA 2838 00` on most RTL-SDRs (some show
+   *RTL2838UHIDIR*). Not Interface 1, and never a device you don't recognise: replacing a keyboard's, mouse's or
+   headset's driver stops it working.
+4. Check that the driver right of the arrow says **WinUSB**, click **Install Driver** / **Replace Driver**, then
+   unplug the SDR and plug it back in.
+
+You normally do this once per PC: Windows keeps the driver for that SDR model on every USB port. Do it again on a
+new or reinstalled PC, after Windows Update replaces the driver, or for a different SDR model.
+
+**To check it:** in Device Manager, *Universal Serial Bus devices* lists **Bulk-In, Interface**, and its
+Properties > Driver tab shows provider *libwdi*. A second *Bulk-In, Interface* with a warning under *Other
+devices* is normal: that is the dongle's unused infrared receiver. If the SDR is only under *Other devices*, or
+under *Sound, video and game controllers* as a TV tuner (Windows' own DVB-T driver), run Zadig again.
 
 ## How it works
 | Step | Software |

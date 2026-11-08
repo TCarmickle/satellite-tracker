@@ -2,15 +2,24 @@
 
 The repository holds the source. The ~550 MB Python runtime (`python\`) and the zip are built,
 not committed. You need conda or mamba ([radioconda](https://github.com/ryanvolz/radioconda) or
-[Miniforge](https://github.com/conda-forge/miniforge)).
+[Miniforge](https://github.com/conda-forge/miniforge)). On a PC with neither, install Miniforge:
+*Miniforge3-Windows-x86_64.exe*, "Just Me", default folder `%USERPROFILE%\miniforge3` (no need to
+add it to PATH). Git ([Git for Windows](https://gitforwindows.org)) is only needed to clone and pull;
+*Code > Download ZIP* works too.
 
 ## 1. The runtime
 ```bat
-python build\build_runtime.py
+%USERPROFILE%\miniforge3\python.exe build\build_runtime.py
 ```
 Creates `python\` from `build\environment.yml` (pinned versions, OpenBLAS instead of MKL), then
 removes what is only needed for building software (debug symbols, headers, static libraries).
-Use `--conda path\to\mamba.exe` if it can't find conda, `--force` to rebuild.
+Downloads about 1 GB; the result is 550-650 MB. Any Python 3 can run the script, but a plain
+`python` on Windows is often only the Microsoft Store shortcut, so Miniforge's own is used above.
+It finds conda in `%USERPROFILE%\radioconda` or `%USERPROFILE%\miniforge3` (or on PATH); use
+`--conda path\to\mamba.exe` if it can't, `--force` to rebuild.
+
+The runtime does not include the SDR's USB driver: install WinUSB once per PC with Zadig (see
+"The SDR's USB driver" in [README.md](README.md)), or the receiver stops with `usb_open error -5`.
 
 > Note: the app limits OpenBLAS to one thread (`OPENBLAS_NUM_THREADS=1`). Otherwise OpenBLAS
 > reserves a buffer per CPU core (~2.5 GB on 20 cores) and the receiver's memory watchdog stops

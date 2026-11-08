@@ -13,7 +13,9 @@ sky plot show every system together, with a Systems filter to show just one.
 
 Everything is in this folder: the decoders (gr-iridium, iridium-toolkit, gr-satellites,
 PocketSDR), Python, and the app.
-Nothing is installed on the computer.
+Nothing is installed on the computer except the SDR's USB driver (see "THE USB DRIVER" below).
+If you got this folder from GitHub rather than the ready-made zip, it has no "python" folder
+yet: see "INSTALLING FROM GITHUB" below first.
 
 
 WHAT YOU NEED
@@ -31,15 +33,49 @@ WHAT YOU NEED
   with a bias-T to power it.
 
 
+INSTALLING FROM GITHUB (only if you have no "python" folder)
+-----------------------------------------------------------
+The ready-made zip already holds its own Python. The GitHub repository holds only the source,
+so the Python folder (Python, GNU Radio and the decoders) is built on your PC once:
+1. Get the code into a folder you can write to (not "Program Files"): with Git for Windows
+   (https://gitforwindows.org), "git clone https://github.com/TCarmickle/satellite-tracker.git",
+   or on GitHub: Code > Download ZIP. Git is only needed if you want to pull updates.
+2. Install Miniforge once (https://github.com/conda-forge/miniforge): the
+   Miniforge3-Windows-x86_64.exe installer, "Just Me", default folder. Adding it to PATH is not
+   needed.
+3. In a Command Prompt, in this folder, run:
+       %USERPROFILE%\miniforge3\python.exe build\build_runtime.py
+   It downloads about 1 GB and leaves a "python" folder of about 550-650 MB; it takes several
+   minutes. Use Miniforge's Python as shown - a plain "python" is often only the Microsoft Store
+   shortcut. BUILDING.md has the details.
+4. Then install the USB driver (next section) and carry on with STARTING.
+
+
 ONE-TIME SETUP: THE USB DRIVER (needs administrator rights)
 -----------------------------------------------------------
-Windows needs the WinUSB driver for the SDR. This cannot be bundled.
-1. Plug in the SDR.
-2. Download Zadig from https://zadig.akeo.ie and run it.
+Windows needs the WinUSB driver for the SDR. This cannot be bundled, and Windows does not
+install it by itself. Without it the tracker's window opens normally, but "Start receiver"
+stops at once with "the SDR ... could not be opened", and the receiver log
+(data\captures\output-*.log) shows "usb_open error -5" and "Failed to open rtlsdr device".
+1. Plug in the SDR - preferably into a USB 2.0 port straight on the PC: USB 3.0 ports give off
+   radio noise near L-band, and hubs shared with other devices have dropped the SDR.
+2. Download Zadig from https://zadig.akeo.ie and run it (Windows asks for administrator rights).
 3. Options menu > List All Devices.
-4. Pick "Bulk-In, Interface (Interface 0)" (or "RTL2838UHIDIR").
+4. Pick "Bulk-In, Interface (Interface 0)" - USB ID 0BDA 2838 00 on most RTL-SDRs (some show
+   "RTL2838UHIDIR"). NOT Interface 1, and never a device you don't recognise: replacing the
+   driver of a keyboard, mouse or headset stops it working.
 5. Make sure the driver on the right says WinUSB, then click "Replace Driver" (or "Install Driver").
-You only do this once per computer.
+6. Unplug the SDR and plug it back in.
+You normally do this once per computer: Windows keeps the driver for that SDR model on every USB
+port. Do it again on a new or reinstalled PC, if Windows Update replaces the driver, or for a
+different SDR model.
+
+Checking the driver: open Device Manager (right-click Start > Device Manager). Under "Universal
+Serial Bus devices" there should be "Bulk-In, Interface"; its Properties > Driver tab says the
+provider is libwdi. A second "Bulk-In, Interface" with a yellow warning under "Other devices" is
+normal - that is the dongle's infrared remote receiver, which is not used. If the SDR only shows
+under "Other devices", or under "Sound, video and game controllers" as a TV tuner (Windows' own
+DVB-T driver), run Zadig again.
 
 
 STARTING
@@ -51,7 +87,7 @@ STARTING
    wheel (drag to move) and click your house; the height there is looked up automatically
    (the point is sent to open-meteo.com). "Type coordinates..." lets you enter it instead.
    To change it later, click the location button (pin) at the top right of the window.
-   It is saved in app\settings.json.
+   It is saved in data\settings.json.
 4. Press the green "Start receiver" button at the top. Close SDR++, SatDump or any other
    program using the SDR first - only one program can use it at a time.
 5. Press "Stop receiver" when you're done. The capture is then decoded into the catalog
@@ -435,13 +471,16 @@ If you share your capture files or catalog, remember they contain your location.
 
 TROUBLESHOOTING
 ---------------
-"the SDR could not be opened"   The SDR is unplugged, the Zadig driver isn't installed, or
-                                another program (SDR++, SatDump...) is using it.
+"the SDR could not be opened"   The SDR is unplugged, the WinUSB driver isn't installed, or
+                                another program (SDR++, SatDump...) is using it. If the
+                                receiver log says "usb_open error -5", it is the driver: see
+                                "THE USB DRIVER" near the top.
 "decoder used over 2 GB"        Too many false bursts - the threshold is too low or there is
                                 strong interference. It stops itself to protect the computer.
 Nothing decoded                 Check the antenna is outside with sky view; Iridium is at
                                 1616-1626.5 MHz.
-Errors                          See app\tracker-error.log and the output-*.log files.
+Errors                          See data\tracker-error.log and the receiver logs
+                                (data\captures\*.log).
 
 
 CREDITS AND LICENSES

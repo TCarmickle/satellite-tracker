@@ -572,7 +572,8 @@ class Receiver(QtCore.QObject):
                         self.reopen_tries = 0
                     self.reopen_band = self.sdr.get('system')
             if 'Failed to open' in self.stop_reason or 'usb_claim' in self.stop_reason:
-                self.stop_reason = ('the SDR (%s) could not be opened - is it plugged in, and are SDR++, SatDump '
+                self.stop_reason = ('the SDR (%s) could not be opened - is it plugged in, is its WinUSB driver '
+                                    'installed (README: THE USB DRIVER), and are SDR++, SatDump '
                                     % self.sdr['device'] +
                                     'and other receivers (like the Satellite Console) closed?')
         if self.state != 'stopping':
