@@ -58,7 +58,7 @@ class SettingsDialog(QtWidgets.QDialog):
         pick.setToolTip('Close this window and click your antenna’s spot on the map')
         pick.clicked.connect(self._pick)
         more.addWidget(pick)
-        fix = tracker.gnss_location()
+        fix, _note = tracker.gnss_location()     # (position or None, why) - the pair itself is never empty
         if fix:
             gps = QtWidgets.QPushButton('\U0001F6F0  Use GPS-tracked position')
             gps.setToolTip('%.5f, %.5f, %.0f m - the middle of your %d most recent GNSS position fixes\n'
