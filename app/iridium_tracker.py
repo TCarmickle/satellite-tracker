@@ -3583,6 +3583,14 @@ class Tracker(QtWidgets.QMainWindow):
         first = catalog.HOME is None
         old = (HOME_LAT, HOME_LON, HOME_H)
         set_home(*new)
+        # the globe is given home when it is built (0, 0 on a fresh install) and again only when it comes on screen,
+        # so while it was open it kept the old place - 11-07: 'you are here' off the coast of Nigeria (0, 0) after
+        # setting the location from GPS. Move it along, and look at the new place if it was looking at the old one.
+        g = self.globe.view
+        looking_home = first or (abs(g.lat0 - g.home[0]) < 1e-9 and abs(g.lon0 - g.home[1]) < 1e-9)
+        g.home = (HOME_LAT, HOME_LON)
+        if looking_home:
+            g.center_home()
         self._show_location()
         moved = 0.0 if first else location_dialog.distance_km(old, new)
         self.events.insertItem(0, '%s  Location set to %.5f, %.5f%s' % (
